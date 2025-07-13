@@ -69,7 +69,7 @@ def main():
         os.makedirs(args.output_dir)
     
     # 设置频率参数（从高到低）
-    frequencies = [64, 56, 49]  # 频率值
+    frequencies = [71, 64, 58]  # 频率值
     
     # 设置相移参数（4步相移）
     phase_shifts = [0, np.pi/2, np.pi, 3*np.pi/2]  # 0°, 90°, 180°, 270°

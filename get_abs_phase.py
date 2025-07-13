@@ -1,6 +1,30 @@
 import numpy as np
 import cv2 as cv
 import matplotlib.pyplot as plt
+import matplotlib
+from matplotlib.font_manager import FontProperties
+
+# 设置matplotlib支持中文显示 - 使用更可靠的方法
+try:
+    # 尝试使用SimHei字体
+    font = FontProperties(fname=r"C:\Windows\Fonts\simhei.ttf", size=10)
+    matplotlib.rcParams['font.sans-serif'] = ['SimHei']
+except:
+    try:
+        # 备选方案1: 使用微软雅黑
+        font = FontProperties(fname=r"C:\Windows\Fonts\msyh.ttc", size=10)
+        matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei']
+    except:
+        try:
+            # 备选方案2: 使用宋体
+            font = FontProperties(fname=r"C:\Windows\Fonts\simsun.ttc", size=10)
+            matplotlib.rcParams['font.sans-serif'] = ['SimSun']
+        except:
+            print("警告: 找不到中文字体，标题可能无法正确显示")
+            font = None
+
+# 解决保存图像时负号'-'显示为方块的问题
+matplotlib.rcParams['axes.unicode_minus'] = False
 
 class multi_phase():
     """
@@ -94,30 +118,49 @@ class multi_phase():
         """
         # 根据频率比例缩放参考相位
         # 低频相位乘以频率比得到高频相位的估计值
-        temp=phase_f/reference_f*reference
+        temp = phase_f/reference_f*reference
         
         # 计算整数条纹序数k并应用
         # 用缩放后的低频相位减去高频包裹相位，四舍五入得到整数条纹序数
-        test = np.round(temp-phase)
-        unwarp_phase=phase+np.round(temp-phase)
-
-        # 高斯滤波去噪，检测错误跳变点
-        gauss_size=(5,5)
-        unwarp_phase_noise = unwarp_phase-cv.GaussianBlur(unwarp_phase,gauss_size,0)
-        unwarp_reference_noise = temp-cv.GaussianBlur(temp,gauss_size,0)
-
-        # 检测异常点：展开相位的噪声明显大于参考相位的噪声
-        order_flag = np.abs(unwarp_phase_noise)-np.abs(unwarp_reference_noise)>0.25
+        k = np.round(temp-phase)
+        unwarp_phase = phase + k
         
-        # 修复异常跳变点
-        unwarp_error = unwarp_phase[order_flag]
-        unwarp_error_direct = unwarp_phase_noise[order_flag]
-        # 根据噪声方向调整条纹序数
-        unwarp_error[unwarp_error_direct>0]+=1  # 正向噪声增加一个周期
-        unwarp_error[unwarp_error_direct<0]-=1  # 负向噪声减少一个周期(注意：原代码这里有逻辑错误，已修正)
+        # 高斯滤波去噪，检测错误跳变点
+        # 使用更小的高斯核以保留更多细节
+        gauss_size = (3, 3)
+        unwarp_phase_noise = unwarp_phase - cv.GaussianBlur(unwarp_phase, gauss_size, 0)
+        unwarp_reference_noise = temp - cv.GaussianBlur(temp, gauss_size, 0)
 
-        # 应用修复结果
-        unwarp_phase[order_flag]=unwarp_error
+        # 改进异常点检测：降低阈值，增加相对比例判断
+        noise_ratio = np.abs(unwarp_phase_noise) / (np.abs(unwarp_reference_noise) + 0.001)  # 避免除零
+        order_flag = (np.abs(unwarp_phase_noise) - np.abs(unwarp_reference_noise) > 0.15) & (noise_ratio > 1.5)
+        
+        if np.sum(order_flag) > 0:  # 只在有异常点时进行修复
+            # 修复异常跳变点
+            unwarp_error = unwarp_phase[order_flag]
+            unwarp_error_direct = unwarp_phase_noise[order_flag]
+            
+            # 根据噪声方向调整条纹序数
+            unwarp_error[unwarp_error_direct > 0] -= 1  # 正向噪声减少一个周期
+            unwarp_error[unwarp_error_direct < 0] += 1  # 负向噪声增加一个周期
+            
+            # 应用修复结果
+            unwarp_phase[order_flag] = unwarp_error
+            
+            # 第二次高斯滤波去噪，进一步检测剩余的错误跳变点
+            unwarp_phase_noise = unwarp_phase - cv.GaussianBlur(unwarp_phase, gauss_size, 0)
+            order_flag2 = np.abs(unwarp_phase_noise) > 0.2
+            
+            if np.sum(order_flag2) > 0:
+                unwarp_error2 = unwarp_phase[order_flag2]
+                unwarp_error_direct2 = unwarp_phase_noise[order_flag2]
+                
+                # 根据噪声方向调整条纹序数
+                unwarp_error2[unwarp_error_direct2 > 0] -= 1  # 正向噪声减少一个周期
+                unwarp_error2[unwarp_error_direct2 < 0] += 1  # 负向噪声增加一个周期
+                
+                # 应用修复结果
+                unwarp_phase[order_flag2] = unwarp_error2
 
         return unwarp_phase
 
@@ -146,6 +189,16 @@ class multi_phase():
 
         plt.figure()
         plt.imshow(phase_1x)
+        plt.title('原始包裹相位: 水平高频 (1x)', fontproperties=font)
+        plt.colorbar()
+        plt.figure()
+        plt.imshow(phase_2x)
+        plt.title('原始包裹相位: 水平中频 (2x)', fontproperties=font)
+        plt.colorbar()
+        plt.figure()
+        plt.imshow(phase_3x)
+        plt.title('原始包裹相位: 水平低频 (3x)', fontproperties=font)
+        plt.colorbar()
         #plt.show()
 
         # 2. 外差法获取逐级展开的相位差
@@ -159,11 +212,36 @@ class multi_phase():
         phase_23x = self.phase_diff(phase_2x,phase_3x)  # 频率2和3的差异
         phase_123x = self.phase_diff(phase_12x,phase_23x) # 差异的差异(等效最低频)
 
+        # 显示相位差结果
         plt.figure()
-        plt.imshow(phase_12x)
+        plt.subplot(131)
+        plt.imshow(phase_12x, cmap='jet')
+        plt.title('相位差: 水平(高-中)', fontproperties=font)
+        plt.colorbar()
+        plt.subplot(132)
+        plt.imshow(phase_23x, cmap='jet')
+        plt.title('相位差: 水平(中-低)', fontproperties=font)
+        plt.colorbar()
+        plt.subplot(133)
+        plt.imshow(phase_123x, cmap='jet')
+        plt.title('相位差: 水平((高-中)-(中-低))', fontproperties=font)
+        plt.colorbar()
+        plt.tight_layout()
 
         plt.figure()
-        plt.imshow(phase_123x)
+        plt.subplot(131)
+        plt.imshow(phase_12y, cmap='jet')
+        plt.title('相位差: 垂直(高-中)', fontproperties=font)
+        plt.colorbar()
+        plt.subplot(132)
+        plt.imshow(phase_23y, cmap='jet')
+        plt.title('相位差: 垂直(中-低)', fontproperties=font)
+        plt.colorbar()
+        plt.subplot(133)
+        plt.imshow(phase_123y, cmap='jet')
+        plt.title('相位差: 垂直((高-中)-(中-低))', fontproperties=font)
+        plt.colorbar()
+        plt.tight_layout()
         #plt.show()
 
         # 3. 平滑最低等效频率相位以提高鲁棒性
@@ -178,6 +256,29 @@ class multi_phase():
         unwarp_phase_12_x = self.unwarpphase(phase_123x,phase_12x,1,self.f12)
         unwarp_phase_23_x = self.unwarpphase(phase_123x,phase_23x,1,self.f23)
         
+        # 显示一级解包裹结果
+        plt.figure()
+        plt.subplot(121)
+        plt.imshow(unwarp_phase_12_x, cmap='jet一级解包裹相位的结果，即用phase_123x对phase_12x进行解包裹的结果')
+        plt.title('解包裹相位: 水平(高-中)', fontproperties=font)
+        plt.colorbar()
+        plt.subplot(122)
+        plt.imshow(unwarp_phase_23_x, cmap='jet一级解包裹相位的结果，即用phase_123x对phase_23x进行解包裹的结果')
+        plt.title('解包裹相位: 水平(中-低)', fontproperties=font)
+        plt.colorbar()
+        plt.tight_layout()
+
+        plt.figure()
+        plt.subplot(121)
+        plt.imshow(unwarp_phase_12_y, cmap='jet一级解包裹相位的结果，即用phase_123y对phase_12y进行解包裹的结果')
+        plt.title('解包裹相位: 垂直(高-中)', fontproperties=font)
+        plt.colorbar()
+        plt.subplot(122)
+        plt.imshow(unwarp_phase_23_y, cmap='jet一级解包裹相位的结果，即用phase_123y对phase_23y进行解包裹的结果')
+        plt.title('解包裹相位: 垂直(中-低)', fontproperties=font)
+        plt.colorbar()
+        plt.tight_layout()
+        
         # 5. 使用展开后的中等频率相位差(unwarp_phase_12_y/x和unwarp_phase_23_y/x)
         # 展开中频相位(phase_2y/x)
         unwarp_phase2_y_12 = self.unwarpphase(unwarp_phase_12_y,phase_2y,self.f12,self.f[1])
@@ -185,6 +286,29 @@ class multi_phase():
 
         unwarp_phase2_x_12 = self.unwarpphase(unwarp_phase_12_x,phase_2x,self.f12,self.f[1])
         unwarp_phase2_x_23 = self.unwarpphase(unwarp_phase_23_x,phase_2x,self.f23,self.f[1])
+
+        # 显示二级解包裹结果（通过两个路径）
+        plt.figure()
+        plt.subplot(121)
+        plt.imshow(unwarp_phase2_x_12/self.f[1], cmap='jet')
+        plt.title('二级解包裹: 水平((高-中)路径)', fontproperties=font)
+        plt.colorbar()
+        plt.subplot(122)
+        plt.imshow(unwarp_phase2_x_23/self.f[1], cmap='jet')
+        plt.title('二级解包裹: 水平((中-低)路径)', fontproperties=font)
+        plt.colorbar()
+        plt.tight_layout()
+
+        plt.figure()
+        plt.subplot(121)
+        plt.imshow(unwarp_phase2_y_12/self.f[1], cmap='jet')
+        plt.title('二级解包裹: 垂直((高-中)路径)', fontproperties=font)
+        plt.colorbar()
+        plt.subplot(122)
+        plt.imshow(unwarp_phase2_y_23/self.f[1], cmap='jet')
+        plt.title('二级解包裹: 垂直((中-低)路径)', fontproperties=font)
+        plt.colorbar()
+        plt.tight_layout()
 
         # 6. 取两个展开路径的平均值以提高鲁棒性
         unwarp_phase_y = (unwarp_phase2_y_12+unwarp_phase2_y_23)/2
@@ -194,12 +318,30 @@ class multi_phase():
         unwarp_phase_y/=self.f[1]  # 以中频为基准归一化
         unwarp_phase_x/=self.f[1]  # 以中频为基准归一化
 
+        # 显示最终结果
+        plt.figure()
+        plt.subplot(121)
+        plt.imshow(unwarp_phase_x, cmap='jet')
+        plt.title('最终解包裹相位: 水平方向', fontproperties=font)
+        plt.colorbar()
+        plt.subplot(122)
+        plt.imshow(unwarp_phase_y, cmap='jet')
+        plt.title('最终解包裹相位: 垂直方向', fontproperties=font)
+        plt.colorbar()
+        plt.tight_layout()
+
         # 8. 计算相位质量，使用调制度/偏移比值的最小值
         ratio_x = np.min([amp1_x/offset1_x,amp2_x/offset2_x,amp3_x/offset3_x],axis=0)
         ratio_y = np.min([amp1_y/offset1_y,amp2_y/offset2_y,amp3_y/offset3_y],axis=0)
 
         ratio = np.min([ratio_x,ratio_y],axis=0)  # 取水平和垂直方向的最小值作为最终质量图
-
+        
+        # 显示相位质量图
+        plt.figure()
+        plt.imshow(ratio, cmap='viridis')
+        plt.title('相位质量图', fontproperties=font)
+        plt.colorbar()
+        
         return unwarp_phase_y,unwarp_phase_x,ratio
 
 
