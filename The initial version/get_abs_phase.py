@@ -187,6 +187,8 @@ class multi_phase():
         phase_2x,amp2_x,offset2_x = self.decode_phase(image=self.images[16:20]) # 中频
         phase_3x,amp3_x,offset3_x = self.decode_phase(image=self.images[20:24]) # 低频
 
+        # 注释掉所有中间过程的可视化代码
+        """
         plt.figure()
         plt.imshow(phase_1x)
         plt.title('原始包裹相位: 水平高频 (1x)', fontproperties=font)
@@ -199,6 +201,7 @@ class multi_phase():
         plt.imshow(phase_3x)
         plt.title('原始包裹相位: 水平低频 (3x)', fontproperties=font)
         plt.colorbar()
+        """
         #plt.show()
 
         # 2. 外差法获取逐级展开的相位差
@@ -212,6 +215,8 @@ class multi_phase():
         phase_23x = self.phase_diff(phase_2x,phase_3x)  # 频率2和3的差异
         phase_123x = self.phase_diff(phase_12x,phase_23x) # 差异的差异(等效最低频)
 
+        # 注释掉所有中间过程的可视化代码
+        """
         # 显示相位差结果
         plt.figure()
         plt.subplot(131)
@@ -242,6 +247,7 @@ class multi_phase():
         plt.title('相位差: 垂直((高-中)-(中-低))', fontproperties=font)
         plt.colorbar()
         plt.tight_layout()
+        """
         #plt.show()
 
         # 3. 平滑最低等效频率相位以提高鲁棒性
@@ -256,28 +262,31 @@ class multi_phase():
         unwarp_phase_12_x = self.unwarpphase(phase_123x,phase_12x,1,self.f12)
         unwarp_phase_23_x = self.unwarpphase(phase_123x,phase_23x,1,self.f23)
         
+        # 注释掉所有中间过程的可视化代码
+        """
         # 显示一级解包裹结果
         plt.figure()
         plt.subplot(121)
-        plt.imshow(unwarp_phase_12_x, cmap='jet一级解包裹相位的结果，即用phase_123x对phase_12x进行解包裹的结果')
+        plt.imshow(unwarp_phase_12_x, cmap='jet')
         plt.title('解包裹相位: 水平(高-中)', fontproperties=font)
         plt.colorbar()
         plt.subplot(122)
-        plt.imshow(unwarp_phase_23_x, cmap='jet一级解包裹相位的结果，即用phase_123x对phase_23x进行解包裹的结果')
+        plt.imshow(unwarp_phase_23_x, cmap='jet')
         plt.title('解包裹相位: 水平(中-低)', fontproperties=font)
         plt.colorbar()
         plt.tight_layout()
 
         plt.figure()
         plt.subplot(121)
-        plt.imshow(unwarp_phase_12_y, cmap='jet一级解包裹相位的结果，即用phase_123y对phase_12y进行解包裹的结果')
+        plt.imshow(unwarp_phase_12_y, cmap='jet')
         plt.title('解包裹相位: 垂直(高-中)', fontproperties=font)
         plt.colorbar()
         plt.subplot(122)
-        plt.imshow(unwarp_phase_23_y, cmap='jet一级解包裹相位的结果，即用phase_123y对phase_23y进行解包裹的结果')
+        plt.imshow(unwarp_phase_23_y, cmap='jet')
         plt.title('解包裹相位: 垂直(中-低)', fontproperties=font)
         plt.colorbar()
         plt.tight_layout()
+        """
         
         # 5. 使用展开后的中等频率相位差(unwarp_phase_12_y/x和unwarp_phase_23_y/x)
         # 展开中频相位(phase_2y/x)
@@ -287,6 +296,8 @@ class multi_phase():
         unwarp_phase2_x_12 = self.unwarpphase(unwarp_phase_12_x,phase_2x,self.f12,self.f[1])
         unwarp_phase2_x_23 = self.unwarpphase(unwarp_phase_23_x,phase_2x,self.f23,self.f[1])
 
+        # 注释掉所有中间过程的可视化代码
+        """
         # 显示二级解包裹结果（通过两个路径）
         plt.figure()
         plt.subplot(121)
@@ -309,6 +320,7 @@ class multi_phase():
         plt.title('二级解包裹: 垂直((中-低)路径)', fontproperties=font)
         plt.colorbar()
         plt.tight_layout()
+        """
 
         # 6. 取两个展开路径的平均值以提高鲁棒性
         unwarp_phase_y = (unwarp_phase2_y_12+unwarp_phase2_y_23)/2
@@ -318,6 +330,8 @@ class multi_phase():
         unwarp_phase_y/=self.f[1]  # 以中频为基准归一化
         unwarp_phase_x/=self.f[1]  # 以中频为基准归一化
 
+        # 注释掉所有中间过程的可视化代码
+        """
         # 显示最终结果
         plt.figure()
         plt.subplot(121)
@@ -329,6 +343,7 @@ class multi_phase():
         plt.title('最终解包裹相位: 垂直方向', fontproperties=font)
         plt.colorbar()
         plt.tight_layout()
+        """
 
         # 8. 计算相位质量，使用调制度/偏移比值的最小值
         ratio_x = np.min([amp1_x/offset1_x,amp2_x/offset2_x,amp3_x/offset3_x],axis=0)
@@ -336,35 +351,35 @@ class multi_phase():
 
         ratio = np.min([ratio_x,ratio_y],axis=0)  # 取水平和垂直方向的最小值作为最终质量图
         
+        # 注释掉所有中间过程的可视化代码
+        """
         # 显示相位质量图
         plt.figure()
         plt.imshow(ratio, cmap='viridis')
         plt.title('相位质量图', fontproperties=font)
         plt.colorbar()
+        """
         
-        return unwarp_phase_y,unwarp_phase_x,ratio
+        return unwarp_phase_y,unwarp_phase_x,ratio, phase_2y, phase_2x
 
-
-# 以下是被注释掉的旧版解码相位函数，仅供参考
-# def decode_phase(fore,phase_step,phase):
-#     """
-#     旧版相位解码函数，未被使用
-#     """
-#     if len(phase) !=4:
-#         print("the image numbers of phase is {}".format(len(phase)))
-#         raise("please check out the phase")
+"""
+以下是被注释掉的旧版解码相位函数，仅供参考
+def decode_phase(fore,phase_step,phase):
     
-#     temp = 2*np.pi*np.arange(phase_step,dtype=np.float32)/phase_step
-#     temp.shape = -1,1,1
-#     molecule = np.sum(phase*np.sin(temp),axis=0)
-#     denominator=np.sum(phase*np.cos(temp),axis=0)
+    #旧版相位解码函数，未被使用
+    if len(phase) !=4:
+        print("the image numbers of phase is {}".format(len(phase)))
+        raise("please check out the phase")
 
-#     result = -np.arctan2(molecule,denominator)
+    temp = 2*np.pi*np.arange(phase_step,dtype=np.float32)/phase_step
+    temp.shape = -1,1,1
+    molecule = np.sum(phase*np.sin(temp),axis=0)
+    denominator=np.sum(phase*np.cos(temp),axis=0)
 
-#     #归一化
-#     result = (result+np.pi)/(2*np.pi)*fore
+    result = -np.arctan2(molecule,denominator)
 
-#     return result
+    #归一化
+    result = (result+np.pi)/(2*np.pi)*fore
 
-
-
+    return result
+"""
