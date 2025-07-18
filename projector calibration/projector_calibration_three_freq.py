@@ -207,37 +207,29 @@ def visualize_phase(phase_data: np.ndarray, title: str, save_path: str, show_plo
 
 
 class multi_phase:
-    """
-    三频相位解包裹类
-    集成自 get_abs_phase.py
-    """
+    """三频外差相位处理类"""
     
     def __init__(self, f: List[int], step: int, images: List[np.ndarray], ph0: float = 0.5):
         """
-        初始化三频相位解包裹
+        初始化三频相位处理器
         
         参数:
             f: 频率列表 [高频, 中频, 低频]
             step: 相移步数
-            images: 图像列表 (24张图像)
+            images: 24张图像列表
             ph0: 初始相位偏移
         """
-        self.f = f  # 频率列表
-        self.step = step  # 相移步数
-        self.images = images  # 图像列表
-        self.ph0 = ph0  # 初始相位偏移
+        self.f = f
+        self.step = step
+        self.images = images
+        self.ph0 = ph0
         
-        # 验证输入参数
-        if len(f) != 3:
-            raise ValueError("必须提供3个频率值")
         if len(images) != 24:
             raise ValueError(f"需要24张图像，但提供了{len(images)}张")
-        if step != 4:
-            raise ValueError("当前只支持4步相移")
     
-    def get_phase(self):
+    def get_phase(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        执行三频相位解包裹
+        获取解包裹相位
         
         返回:
             unwrapped_vertical: 垂直方向解包裹相位
@@ -284,12 +276,15 @@ class multi_phase:
             )
             
             # 计算质量图
-            quality_map = self._compute_quality_map(h_images['high'], v_images['high'])
+            quality_map = self._compute_quality_map(
+                list(h_images['high']), 
+                list(v_images['high'])
+            )
             
             return unwrapped_v, unwrapped_h, quality_map
             
         except Exception as e:
-            raise RuntimeError(f"三频相位解包裹失败: {e}")
+            raise PhaseUnwrappingError(f"相位解包裹失败: {e}")
     
     def _compute_wrapped_phase(self, images: List[np.ndarray]) -> np.ndarray:
         """
@@ -299,24 +294,15 @@ class multi_phase:
             images: 4张相移图像
             
         返回:
-            wrapped_phase: 包裹相位 (-π到π)
+            wrapped_phase: 包裹相位
         """
         if len(images) != 4:
-            raise ValueError(f"4步相移需要4张图像，但提供了{len(images)}张")
+            raise ValueError("需要4张相移图像")
         
-        # 转换为浮点数
         I1, I2, I3, I4 = [img.astype(np.float32) for img in images]
         
         # 4步相移算法
-        # I1: 0°, I2: 90°, I3: 180°, I4: 270°
-        numerator = I4 - I2
-        denominator = I1 - I3
-        
-        # 避免除零
-        denominator = np.where(np.abs(denominator) < 1e-6, 1e-6, denominator)
-        
-        # 计算包裹相位
-        wrapped_phase = np.arctan2(numerator, denominator)
+        wrapped_phase = np.arctan2(I4 - I2, I1 - I3)
         
         return wrapped_phase
     
@@ -778,7 +764,7 @@ def three_freq_projector_calibration(projector_width: int, projector_height: int
                                     ph0: float = 0.5,
                                     quality_threshold: float = 0.3,
                                     print_func=print) -> Tuple[ProjectorCalibration, str]:
-    """主标定函数 - 增强错误处理"""
+    """主标定函数 - 完整实现"""
     
     # 输入验证
     if not os.path.exists(camera_params_file):
@@ -790,9 +776,6 @@ def three_freq_projector_calibration(projector_width: int, projector_height: int
     if len(frequencies) != 3:
         raise ValueError("必须提供3个频率值")
     
-    if not (0.1 <= quality_threshold <= 1.0):
-        raise ValueError("质量阈值必须在0.1-1.0之间")
-    
     print_func(f"投影仪标定程序 (基于三频外差相位解包裹)")
     print_func("=" * 60)
     
@@ -802,69 +785,57 @@ def three_freq_projector_calibration(projector_width: int, projector_height: int
         phase_step=phase_step,
         ph0=ph0,
         projector_width=projector_width,
-        projector_height=projector_height
+        projector_height=projector_height,
+        quality_threshold=quality_threshold
     )
-    
-    # 检查输入文件夹
-    if not os.path.isdir(phase_images_folder):
-        raise FileNotFoundError(f"指定的相位图像文件夹不存在: {phase_images_folder}")
     
     # 设置输出文件夹
     if output_folder is None:
         output_folder = os.path.join(phase_images_folder, "three_freq_calibration_results")
     os.makedirs(output_folder, exist_ok=True)
     
-    # 读取相机标定参数
-    print_func("读取相机标定参数...")
+    # 加载相机标定参数
+    print_func("加载相机标定参数...")
     try:
-        camera_matrix, camera_distortion = load_camera_parameters(camera_params_file)
+        if camera_params_file.endswith('.npz'):
+            camera_data = np.load(camera_params_file)
+            camera_matrix = camera_data['camera_matrix']
+            camera_distortion = camera_data['dist_coeffs']
+        elif camera_params_file.endswith('.json'):
+            with open(camera_params_file, 'r') as f:
+                camera_data = json.load(f)
+            camera_matrix = np.array(camera_data['camera_matrix'])
+            camera_distortion = np.array(camera_data['dist_coeffs'])
+        else:
+            raise ValueError("不支持的相机标定文件格式")
     except Exception as e:
-        raise FileNotFoundError(f"读取相机标定参数失败: {e}")
+        raise FileNotFoundError(f"无法加载相机标定参数: {e}")
     
     print_func(f"相机内参矩阵:\n{camera_matrix}")
     
-    # 获取子文件夹列表
-    pose_folders = [f for f in os.listdir(phase_images_folder) 
-                   if os.path.isdir(os.path.join(phase_images_folder, f))]
+    # 验证文件夹结构
+    print_func("验证图像文件夹结构...")
+    valid_pose_folders = validate_image_folder_structure(phase_images_folder)
+    print_func(f"找到 {len(valid_pose_folders)} 个有效姿态文件夹")
     
-    if not pose_folders:
-        raise ValueError(f"在文件夹 '{phase_images_folder}' 中未找到子文件夹")
-    
-    print_func(f"找到 {len(pose_folders)} 个标定姿态文件夹")
-    
-    # 存储所有姿态的数据
+    # 处理每个姿态
     all_obj_points = []
     all_proj_points = []
     all_cam_points = []
-    valid_poses_count = 0
     
-    # 处理每个姿态
-    for pose_name in sorted(pose_folders):
-        pose_folder = os.path.join(phase_images_folder, pose_name)
-        print_func(f"\n处理姿态: {pose_name}")
+    for i, pose_folder in enumerate(valid_pose_folders):
+        pose_name = os.path.basename(pose_folder)
+        print_func(f"\n处理姿态 {i+1}/{len(valid_pose_folders)}: {pose_name}")
         
         try:
-            # 获取图像文件列表
-            image_files = {}
-            for i in range(1, 25):  # 1-24
-                for ext in ['.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff']:
-                    img_path = os.path.join(pose_folder, f"I{i}{ext}")
-                    if os.path.exists(img_path):
-                        image_files[f'I{i}'] = img_path
-                        break
-            
-            if len(image_files) != 24:
-                print_func(f"  警告: 姿态 {pose_name} 中图像数量不足 (需要24张，找到{len(image_files)}张)，跳过")
-                continue
-            
-            # 组织图像路径
-            image_paths = [image_files[f'I{i}'] for i in range(1, 25)]
+            # 加载图像路径
+            image_paths = load_pose_images(pose_folder)
             organized_paths = organize_three_freq_images(image_paths, config)
             
-            # 执行三频相位解包裹
-            pose_output_dir = os.path.join(output_folder, f"phase_results_{pose_name}")
+            # 执行三频外差相位解包裹
+            print_func("  - 执行三频外差相位解包裹...")
             unwrapped_v, unwrapped_h, quality_map = process_three_freq_phase_unwrapping(
-                organized_paths, config, pose_output_dir, visualize
+                organized_paths, config, output_folder if visualize else None, visualize
             )
             
             # 使用第一张垂直图像进行角点检测
@@ -877,9 +848,10 @@ def three_freq_projector_calibration(projector_width: int, projector_height: int
             )
             
             if cam_points_pose is None or len(cam_points_pose) == 0:
-                raise BoardDetectionError(f"在姿态 {pose_name} 的图像中未能检测到标定板。")
+                print_func(f"  警告: 在姿态 {pose_name} 中未能检测到标定板，跳过")
+                continue
             
-            print_func(f"  - 成功检测到 {len(cam_points_pose)} 个角点。")
+            print_func(f"  - 成功检测到 {len(cam_points_pose)} 个角点")
             
             # 提取投影仪中的对应点
             proj_points_pose = []
@@ -890,14 +862,10 @@ def three_freq_projector_calibration(projector_width: int, projector_height: int
             if not np.any(valid_mask):
                 print_func(f"  警告: 姿态 {pose_name} 中没有满足质量要求的相位点，跳过")
                 continue
-                
-            v_valid = unwrapped_v[valid_mask]
-            h_valid = unwrapped_h[valid_mask]
-            v_min, v_max = np.min(v_valid), np.max(v_valid)
-            h_min, h_max = np.min(h_valid), np.max(h_valid)
             
-            for i, point in enumerate(cam_points_pose):
-                x, y = point[0]
+            # 为每个相机角点找到对应的投影仪点
+            for j, cam_point in enumerate(cam_points_pose.reshape(-1, 2)):
+                x, y = cam_point[0], cam_point[1]
                 
                 # 检查坐标是否在图像范围内
                 if 0 <= int(y) < unwrapped_v.shape[0] and 0 <= int(x) < unwrapped_v.shape[1]:
@@ -906,43 +874,34 @@ def three_freq_projector_calibration(projector_width: int, projector_height: int
                     phi_h = bilinear_interpolate(unwrapped_h, y, x)
                     quality = bilinear_interpolate(quality_map, y, x)
                     
-                    # 检查质量
+                    # 检查质量是否满足要求
                     if quality > quality_threshold:
-                        # 相位值到投影仪像素坐标的映射
-                        px = (phi_h - h_min) / (h_max - h_min) * (projector_width - 1)
-                        py = (phi_v - v_min) / (v_max - v_min) * (projector_height - 1)
+                        # 将相位转换为投影仪坐标
+                        proj_x = phi_h / (2 * np.pi) * projector_width
+                        proj_y = phi_v / (2 * np.pi) * projector_height
                         
                         # 检查投影仪坐标是否在有效范围内
-                        if 0 <= px < projector_width and 0 <= py < projector_height:
-                            proj_points_pose.append([px, py])
-                            valid_indices.append(i)
+                        if 0 <= proj_x < projector_width and 0 <= proj_y < projector_height:
+                            proj_points_pose.append([proj_x, proj_y])
+                            valid_indices.append(j)
             
-            if len(proj_points_pose) < 6:
-                raise CorrespondenceError(f"姿态 {pose_name} 中有效对应点数量不足 ({len(proj_points_pose)} < 6)")
+            if len(proj_points_pose) < 4:
+                print_func(f"  警告: 姿态 {pose_name} 有效对应点太少 ({len(proj_points_pose)} < 4)，跳过")
+                continue
             
-            print_func(f"  - 成功提取 {len(proj_points_pose)} 个有效对应点")
-            
-            # 添加到总数据集
-            valid_obj_points = [obj_points_pose[i] for i in valid_indices]
-            valid_cam_points = [cam_points_pose[i] for i in valid_indices]
+            # 添加到总列表
+            valid_obj_points = obj_points_pose[valid_indices]
+            valid_cam_points = cam_points_pose.reshape(-1, 2)[valid_indices]
             
             all_obj_points.extend(valid_obj_points)
             all_proj_points.extend(proj_points_pose)
             all_cam_points.extend(valid_cam_points)
             
-            valid_poses_count += 1
-            print_func(f"  - 姿态 {pose_name} 处理成功。")
+            print_func(f"  - 成功提取 {len(proj_points_pose)} 个有效对应点")
             
-        except (FileNotFoundError, BoardDetectionError, PhaseUnwrappingError, CorrespondenceError) as e:
-            print_func(f"警告: 跳过姿态 '{pose_name}'，原因: {e}")
-            continue
         except Exception as e:
-            print_func(f"警告: 处理姿态 '{pose_name}' 时发生未知错误，已跳过。错误: {e}")
-            traceback.print_exc()
+            print_func(f"  错误: 处理姿态 {pose_name} 时出错: {e}")
             continue
-    
-    if valid_poses_count < 3:
-        raise CorrespondenceError(f"未能处理足够数量的有效姿态。至少需要3个有效姿态，但只处理了 {valid_poses_count} 个。")
     
     if len(all_obj_points) < 20:
         raise CorrespondenceError(f"总对应点数量不足 ({len(all_obj_points)} < 20)")
@@ -1054,13 +1013,81 @@ def main():
         print(f"\n标定失败: {e}")
         traceback.print_exc()
 
+# 添加文件扫描和加载函数
+def scan_pose_images(pose_folder: str) -> List[str]:
+    """
+    扫描姿态文件夹中的图像文件
+    
+    参数:
+        pose_folder: 姿态文件夹路径
+        
+    返回:
+        image_files: 图像文件路径列表
+    """
+    image_extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif']
+    image_files = []
+    
+    if not os.path.exists(pose_folder):
+        return image_files
+    
+    for file in os.listdir(pose_folder):
+        if any(file.lower().endswith(ext) for ext in image_extensions):
+            image_files.append(os.path.join(pose_folder, file))
+    
+    # 按文件名排序确保顺序正确
+    image_files.sort()
+    return image_files
 
+def load_pose_images(pose_folder: str) -> List[str]:
+    """
+    加载姿态文件夹中的图像路径
+    
+    参数:
+        pose_folder: 姿态文件夹路径
+        
+    返回:
+        image_paths: 24张图像的路径列表
+    """
+    image_files = scan_pose_images(pose_folder)
+    
+    if len(image_files) != 24:
+        raise ValueError(f"姿态文件夹 {pose_folder} 中应包含24张图像，实际找到{len(image_files)}张")
+    
+    return image_files
+
+def validate_image_folder_structure(phase_images_folder: str) -> List[str]:
+    """
+    验证图像文件夹结构
+    
+    参数:
+        phase_images_folder: 相移图像根文件夹
+        
+    返回:
+        valid_pose_folders: 有效的姿态文件夹列表
+    """
+    if not os.path.exists(phase_images_folder):
+        raise FileNotFoundError(f"相移图像文件夹不存在: {phase_images_folder}")
+    
+    pose_folders = [d for d in os.listdir(phase_images_folder) 
+                   if os.path.isdir(os.path.join(phase_images_folder, d))]
+    
+    valid_pose_folders = []
+    for pose_folder in pose_folders:
+        pose_path = os.path.join(phase_images_folder, pose_folder)
+        image_files = scan_pose_images(pose_path)
+        
+        if len(image_files) == 24:
+            valid_pose_folders.append(pose_path)
+        else:
+            print(f"警告: 姿态文件夹 {pose_folder} 图像数量不正确 ({len(image_files)}/24)")
+    
+    if len(valid_pose_folders) < 3:
+        raise ValueError(f"至少需要3个有效姿态文件夹，当前只有{len(valid_pose_folders)}个")
+    
+    return valid_pose_folders
 
 if __name__ == "__main__":
     main()
-
-
-
 
 
 
