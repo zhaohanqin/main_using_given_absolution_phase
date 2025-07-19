@@ -407,6 +407,7 @@ class ThreeFreqProjectorCalibrationGUI(QMainWindow):
         self.ph0_spin.setRange(0.0, 1.0)
         self.ph0_spin.setValue(0.5)
         self.ph0_spin.setDecimals(3)
+        self.ph0_spin.setSingleStep(0.1)  # 设置步长为0.1
         layout.addRow("初始相位偏移:", self.ph0_spin)
         
         # 质量阈值
@@ -414,6 +415,7 @@ class ThreeFreqProjectorCalibrationGUI(QMainWindow):
         self.quality_threshold_spin.setRange(0.1, 1.0)
         self.quality_threshold_spin.setValue(0.3)
         self.quality_threshold_spin.setDecimals(3)
+        self.quality_threshold_spin.setSingleStep(0.1)  # 设置步长为0.1
         layout.addRow("质量阈值:", self.quality_threshold_spin)
         
         # 可视化选项
