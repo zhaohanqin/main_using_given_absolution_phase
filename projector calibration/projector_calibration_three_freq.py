@@ -179,31 +179,7 @@ def assess_calibration_quality(reprojection_error: float, board_type: str):
         print("- 尝试增加标定图像数量，覆盖更多角度和位置")
         print("- 确保标定板在图像中清晰可见且无模糊")
 
-def visualize_phase(phase_data: np.ndarray, title: str, save_path: str, show_plots: bool, 
-                    is_wrapped: bool, quality_map: Optional[np.ndarray] = None):
-    """通用相位可视化函数"""
-    plt.figure(figsize=(12, 9 if is_wrapped and quality_map is not None else 8))
-    
-    if is_wrapped and quality_map is not None:
-        plt.subplot(2, 1, 1)
 
-    img = plt.imshow(phase_data, cmap='jet')
-    plt.colorbar(img, label='Phase (rad)')
-    plt.title(title)
-
-    if is_wrapped and quality_map is not None:
-        plt.subplot(2, 1, 2)
-        quality_img = plt.imshow(quality_map, cmap='viridis')
-        plt.colorbar(quality_img, label='Quality')
-        plt.title("Phase Quality Map")
-
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    if show_plots:
-        plt.show()
-    else:
-        plt.close()
 
 
 class multi_phase:
@@ -460,7 +436,7 @@ class ProjectorCalibration:
         self.reprojection_error = None
     
     def calibrate_projector_with_camera(self, camera_matrix, camera_distortion,
-                                      proj_cam_correspondences, board_points):
+                                      proj_cam_correspondences, board_points, pose_data=None):
         """
         使用相机参数标定投影仪
         
@@ -494,22 +470,18 @@ class ProjectorCalibration:
         projector_points_list = []
         camera_points_list = []
         
-        # 按姿态分组数据
-        points_per_pose = {}
-        for i, corr in enumerate(proj_cam_correspondences):
-            pose_id = i // len(set(range(len(proj_cam_correspondences))))  # 简化的姿态分组
-            if pose_id not in points_per_pose:
-                points_per_pose[pose_id] = {'obj': [], 'proj': [], 'cam': []}
-            
-            points_per_pose[pose_id]['obj'].append(board_points[corr['board_index']])
-            points_per_pose[pose_id]['proj'].append(corr['projector_point'])
-            points_per_pose[pose_id]['cam'].append(corr['camera_point'])
-        
-        # 转换为OpenCV格式
-        for pose_id in points_per_pose:
-            object_points_list.append(np.array(points_per_pose[pose_id]['obj'], dtype=np.float32))
-            projector_points_list.append(np.array(points_per_pose[pose_id]['proj'], dtype=np.float32))
-            camera_points_list.append(np.array(points_per_pose[pose_id]['cam'], dtype=np.float32))
+        # 使用预先组织好的姿态数据（如果提供）
+        if pose_data is not None:
+            for pose_info in pose_data:
+                if len(pose_info['obj_points']) > 0:
+                    object_points_list.append(np.array(pose_info['obj_points'], dtype=np.float32))
+                    projector_points_list.append(np.array(pose_info['proj_points'], dtype=np.float32))
+                    camera_points_list.append(np.array(pose_info['cam_points'], dtype=np.float32))
+        else:
+            # 回退到原来的方法：将所有点作为一个姿态
+            object_points_list.append(np.array(object_points, dtype=np.float32))
+            projector_points_list.append(np.array(projector_points, dtype=np.float32))
+            camera_points_list.append(np.array(camera_points, dtype=np.float32))
         
         # 执行立体标定
         try:
@@ -518,7 +490,13 @@ class ProjectorCalibration:
             projector_dist_init = np.zeros((5,), dtype=np.float32)
             
             # 立体标定
-            ret, camera_matrix_new, camera_dist_new, projector_matrix_new, projector_dist_new, R, T, E, F = cv2.stereoCalibrate(
+            # 获取图像尺寸
+            if len(projector_points_list) > 0 and len(projector_points_list[0]) > 0:
+                image_size = (640, 480)  # 默认尺寸
+            else:
+                image_size = (640, 480)
+
+            ret, _, _, projector_matrix_new, projector_dist_new, R, T, _, _ = cv2.stereoCalibrate(
                 object_points_list,
                 camera_points_list,
                 projector_points_list,
@@ -526,7 +504,7 @@ class ProjectorCalibration:
                 camera_distortion,
                 projector_matrix_init,
                 projector_dist_init,
-                (projector_points[0].shape[0], projector_points[0].shape[1]) if len(projector_points) > 0 else (640, 480),
+                image_size,
                 criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-5),
                 flags=cv2.CALIB_FIX_INTRINSIC
             )
@@ -580,30 +558,7 @@ class ProjectorCalibration:
         else:
             raise ValueError("不支持的文件格式，请使用.npz或.json")
 
-def load_camera_parameters(filename: str) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    加载相机标定参数
-    
-    参数:
-        filename: 参数文件路径
-        
-    返回:
-        camera_matrix: 相机内参矩阵
-        camera_distortion: 相机畸变系数
-    """
-    if filename.endswith('.npz'):
-        data = np.load(filename)
-        camera_matrix = data['camera_matrix']
-        camera_distortion = data['dist_coeffs']
-    elif filename.endswith('.json'):
-        with open(filename, 'r') as f:
-            data = json.load(f)
-        camera_matrix = np.array(data['camera_matrix'])
-        camera_distortion = np.array(data['dist_coeffs'])
-    else:
-        raise ValueError("不支持的文件格式")
-    
-    return camera_matrix, camera_distortion
+
 
 def organize_three_freq_images(image_paths: List[str], config: ThreeFreqCalibrationConfig) -> Dict[str, List[str]]:
     """
@@ -666,7 +621,6 @@ def process_three_freq_phase_unwrapping(organized_paths: Dict[str, List[str]],
     
     # 设置三频参数
     fx = config.frequencies  # 水平方向频率
-    fy = config.frequencies  # 垂直方向频率
     
     try:
         # 创建三频处理对象
@@ -729,13 +683,25 @@ def load_camera_parameters(camera_params_file: str) -> Tuple[np.ndarray, np.ndar
         if camera_params_file.endswith('.npz'):
             camera_data = np.load(camera_params_file)
             camera_matrix = camera_data['camera_matrix']
-            camera_distortion = camera_data['camera_distortion']
+            # 尝试两种可能的键名
+            if 'dist_coeffs' in camera_data:
+                camera_distortion = camera_data['dist_coeffs']
+            elif 'camera_distortion' in camera_data:
+                camera_distortion = camera_data['camera_distortion']
+            else:
+                raise KeyError("未找到畸变系数，请检查文件中是否包含 'dist_coeffs' 或 'camera_distortion'")
         elif camera_params_file.endswith('.json'):
             import json
             with open(camera_params_file, 'r') as f:
                 camera_data = json.load(f)
             camera_matrix = np.array(camera_data['camera_matrix'])
-            camera_distortion = np.array(camera_data['camera_distortion'])
+            # 尝试两种可能的键名
+            if 'dist_coeffs' in camera_data:
+                camera_distortion = np.array(camera_data['dist_coeffs'])
+            elif 'camera_distortion' in camera_data:
+                camera_distortion = np.array(camera_data['camera_distortion'])
+            else:
+                raise KeyError("未找到畸变系数，请检查文件中是否包含 'dist_coeffs' 或 'camera_distortion'")
         else:
             raise ValueError("不支持的文件格式，请使用.npz或.json格式")
         
@@ -822,6 +788,7 @@ def three_freq_projector_calibration(projector_width: int, projector_height: int
     all_obj_points = []
     all_proj_points = []
     all_cam_points = []
+    pose_data = []  # 存储每个姿态的数据
     
     for i, pose_folder in enumerate(valid_pose_folders):
         pose_name = os.path.basename(pose_folder)
@@ -892,11 +859,19 @@ def three_freq_projector_calibration(projector_width: int, projector_height: int
             # 添加到总列表
             valid_obj_points = obj_points_pose[valid_indices]
             valid_cam_points = cam_points_pose.reshape(-1, 2)[valid_indices]
-            
+
+            # 记录这个姿态的数据
+            pose_data.append({
+                'obj_points': valid_obj_points,
+                'proj_points': proj_points_pose,
+                'cam_points': valid_cam_points,
+                'pose_name': pose_name
+            })
+
             all_obj_points.extend(valid_obj_points)
             all_proj_points.extend(proj_points_pose)
             all_cam_points.extend(valid_cam_points)
-            
+
             print_func(f"  - 成功提取 {len(proj_points_pose)} 个有效对应点")
             
         except Exception as e:
@@ -912,8 +887,28 @@ def three_freq_projector_calibration(projector_width: int, projector_height: int
     print_func("执行投影仪标定...")
     calibration = ProjectorCalibration()
     
-    # 准备对应关系数据
+    # 准备对应关系数据 - 按姿态组织
     proj_cam_correspondences = []
+    pose_point_counts = []  # 记录每个姿态的点数
+
+    # 重新组织数据，记录每个姿态的点数
+    current_index = 0
+    for i, pose_folder in enumerate(valid_pose_folders):
+        pose_name = os.path.basename(pose_folder)
+
+        # 计算这个姿态有多少个有效点
+        pose_points = 0
+        for j in range(current_index, len(all_obj_points)):
+            # 这里需要根据实际情况判断点属于哪个姿态
+            # 简化处理：假设点是按姿态顺序添加的
+            pose_points += 1
+            if j == len(all_obj_points) - 1:
+                break
+
+        pose_point_counts.append(pose_points)
+        current_index += pose_points
+
+    # 创建对应关系
     for i in range(len(all_obj_points)):
         proj_cam_correspondences.append({
             'projector_point': all_proj_points[i],
@@ -923,11 +918,12 @@ def three_freq_projector_calibration(projector_width: int, projector_height: int
     
     # 执行标定
     try:
-        reprojection_error, calibration_data = calibration.calibrate_projector_with_camera(
+        reprojection_error, _ = calibration.calibrate_projector_with_camera(
             camera_matrix=camera_matrix,
             camera_distortion=camera_distortion,
             proj_cam_correspondences=proj_cam_correspondences,
-            board_points=all_obj_points
+            board_points=all_obj_points,
+            pose_data=pose_data
         )
     except Exception as e:
         raise CalibrationError(f"投影仪标定失败: {e}")

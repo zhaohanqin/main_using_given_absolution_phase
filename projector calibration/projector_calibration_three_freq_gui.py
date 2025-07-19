@@ -780,6 +780,45 @@ class ThreeFreqProjectorCalibrationGUI(QMainWindow):
         self.progress_bar.setVisible(False)
         self.statusBar().showMessage("标定已取消")
     
+    @Slot(object, str)
+    def handle_calibration_complete(self, calibration, calibration_file):
+        """处理标定完成信号"""
+        self.calibration_result = calibration
+
+        # 更新UI状态
+        self.start_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.progress_bar.setVisible(False)
+        self.statusBar().showMessage("标定完成")
+
+        # 显示标定结果
+        self.result_widget.set_result(calibration)
+        self.results_widget.setCurrentIndex(2)  # 切换到结果选项卡
+
+        # 添加完成消息到日志
+        self.log_text.append(f"<font color='green'>标定完成！结果已保存至: {calibration_file}</font>")
+
+        # 显示成功消息框
+        QMessageBox.information(self, "标定完成",
+                              f"投影仪标定成功完成！\n"
+                              f"重投影误差: {calibration.reprojection_error:.4f} 像素\n"
+                              f"结果已保存至: {calibration_file}")
+
+    @Slot(str)
+    def handle_calibration_error(self, error_message):
+        """处理标定错误信号"""
+        # 更新UI状态
+        self.start_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.progress_bar.setVisible(False)
+        self.statusBar().showMessage("标定失败")
+
+        # 添加错误消息到日志
+        self.log_text.append(f"<font color='red'>标定失败: {error_message}</font>")
+
+        # 显示错误消息框
+        QMessageBox.critical(self, "标定失败", f"标定过程中发生错误:\n{error_message}")
+
     @Slot(str, QPixmap)
     def handle_image_update(self, image_type, pixmap):
         """处理图像更新信号"""
@@ -791,7 +830,7 @@ class ThreeFreqProjectorCalibrationGUI(QMainWindow):
             self.vertical_viewer.set_image(pixmap)
         elif image_type == "quality":
             self.quality_viewer.set_image(pixmap)
-        
+
         # 切换到图像选项卡
         self.results_widget.setCurrentIndex(1)
 
