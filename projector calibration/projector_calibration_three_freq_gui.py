@@ -226,6 +226,8 @@ class ThreeFreqProjectorCalibrationGUI(QMainWindow):
         self.setup_ui()
         self.connect_signals_slots()
         self.apply_styles()
+        # 初始化标定板类型标签
+        self.update_board_type_label()
         
     def setup_ui(self):
         """设置用户界面"""
@@ -347,31 +349,40 @@ class ThreeFreqProjectorCalibrationGUI(QMainWindow):
         """创建标定板参数设置组"""
         group = QGroupBox("标定板参数")
         layout = QFormLayout()
-        
-        # 标定板类型
+
+        # 标定板类型 - 改为中文显示
         self.board_type_combo = QComboBox()
-        self.board_type_combo.addItems(["chessboard", "circles", "ring_circles"])
+        self.board_type_combo.addItems(["棋盘格标定板", "圆形标定板", "环形标定板"])
+        # 存储对应的英文值
+        self.board_type_mapping = {
+            "棋盘格标定板": "chessboard",
+            "圆形标定板": "circles",
+            "环形标定板": "ring_circles"
+        }
         layout.addRow("标定板类型:", self.board_type_combo)
-        
-        # 标定板尺寸
+
+        # 标定板尺寸 - 动态标签
         self.board_width_spin = QSpinBox()
         self.board_width_spin.setRange(3, 20)
         self.board_width_spin.setValue(9)
-        layout.addRow("标定板宽度(内角点):", self.board_width_spin)
-        
+        self.board_width_label = QLabel("标定板宽度(内角点):")
+        layout.addRow(self.board_width_label, self.board_width_spin)
+
         self.board_height_spin = QSpinBox()
         self.board_height_spin.setRange(3, 20)
         self.board_height_spin.setValue(6)
-        layout.addRow("标定板高度(内角点):", self.board_height_spin)
-        
-        # 方格尺寸
+        self.board_height_label = QLabel("标定板高度(内角点):")
+        layout.addRow(self.board_height_label, self.board_height_spin)
+
+        # 方格尺寸 - 动态标签
         self.square_size_spin = QDoubleSpinBox()
         self.square_size_spin.setRange(1.0, 100.0)
         self.square_size_spin.setValue(20.0)
         self.square_size_spin.setDecimals(1)
         self.square_size_spin.setSuffix(" mm")
-        layout.addRow("方格尺寸:", self.square_size_spin)
-        
+        self.square_size_label = QLabel("方格尺寸:")
+        layout.addRow(self.square_size_label, self.square_size_spin)
+
         group.setLayout(layout)
         self.params_layout.addWidget(group)
     
@@ -655,13 +666,41 @@ class ThreeFreqProjectorCalibrationGUI(QMainWindow):
     @Slot()
     def update_board_type_label(self):
         """更新标定板类型标签"""
-        board_type = self.board_type_combo.currentText()
-        if board_type == "chessboard":
-            self.board_width_spin.setSuffix(" (内角点)")
-            self.board_height_spin.setSuffix(" (内角点)")
+        board_type_chinese = self.board_type_combo.currentText()
+
+        if board_type_chinese == "棋盘格标定板":
+            # 棋盘格标定板
+            self.board_width_label.setText("标定板宽度(内角点):")
+            self.board_height_label.setText("标定板高度(内角点):")
+            self.square_size_label.setText("方格尺寸:")
+            self.square_size_spin.setSuffix(" mm")
+            # 设置默认值
+            self.board_width_spin.setValue(9)
+            self.board_height_spin.setValue(6)
+            self.square_size_spin.setValue(20.0)
+
+        elif board_type_chinese in ["圆形标定板", "环形标定板"]:
+            # 圆形标定板和环形标定板
+            self.board_width_label.setText("圆形数量(宽):")
+            self.board_height_label.setText("圆形数量(高):")
+            self.square_size_label.setText("圆形直径:")
+            self.square_size_spin.setSuffix(" mm")
+            # 设置默认值
+            self.board_width_spin.setValue(4)
+            self.board_height_spin.setValue(11)
+            self.square_size_spin.setValue(20.0)
+
+        # 添加提示信息
+        if board_type_chinese == "棋盘格标定板":
+            tooltip = "棋盘格标定板：黑白相间的方格图案，内角点是黑白方格的交点"
+        elif board_type_chinese == "圆形标定板":
+            tooltip = "圆形标定板：黑色圆形在白色背景上的规则排列"
+        elif board_type_chinese == "环形标定板":
+            tooltip = "环形标定板：白色空心圆环在白色背景上，使用与camera_calibration.py相同的检测方法"
         else:
-            self.board_width_spin.setSuffix(" (圆点)")
-            self.board_height_spin.setSuffix(" (圆点)")
+            tooltip = ""
+
+        self.board_type_combo.setToolTip(tooltip)
     
     def validate_inputs(self):
         """验证输入参数"""
@@ -705,9 +744,10 @@ class ThreeFreqProjectorCalibrationGUI(QMainWindow):
     
     def get_calibration_params(self):
         """获取标定参数"""
-        # 获取标定板类型
-        board_type = self.board_type_combo.currentText()
-        
+        # 获取标定板类型（中文）并转换为英文
+        board_type_chinese = self.board_type_combo.currentText()
+        board_type = self.board_type_mapping.get(board_type_chinese, "chessboard")
+
         # 构建参数字典
         params = {
             "camera_params_file": self.camera_params_edit.text().strip(),
@@ -715,7 +755,7 @@ class ThreeFreqProjectorCalibrationGUI(QMainWindow):
             "output_folder": self.output_folder_edit.text().strip(),
             "projector_width": self.proj_width_spin.value(),
             "projector_height": self.proj_height_spin.value(),
-            "board_type": board_type,
+            "board_type": board_type,  # 使用英文值
             "chessboard_width": self.board_width_spin.value(),
             "chessboard_height": self.board_height_spin.value(),
             "square_size": self.square_size_spin.value(),
@@ -725,7 +765,7 @@ class ThreeFreqProjectorCalibrationGUI(QMainWindow):
             "quality_threshold": self.quality_threshold_spin.value(),
             "visualize": self.visualize_check.isChecked()
         }
-        
+
         return params
     
     @Slot()

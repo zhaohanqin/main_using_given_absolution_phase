@@ -90,17 +90,87 @@ def bilinear_interpolate(data: np.ndarray, y: float, x: float, default_value: fl
     return result
 
 
-def detect_calibration_board(image: np.ndarray, board_type: str, chessboard_size: Tuple[int, int], 
-                           square_size: float) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+def configure_detection_parameters(board_type: str) -> Dict[str, Any]:
     """
-    检测标定板角点
-    
+    根据标定板类型配置特定的检测参数
+
+    参数:
+        board_type: 标定板类型
+
+    返回:
+        params: 包含检测参数的字典
+    """
+    params = {}
+
+    if board_type == 'chessboard':
+        params['criteria'] = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+        params['flags'] = None
+    elif board_type == 'circles':
+        # 白底黑圆参数
+        blob_params = cv2.SimpleBlobDetector_Params()
+        blob_params.filterByArea = True
+        blob_params.minArea = 50
+        blob_params.maxArea = 5000
+        params['detector'] = cv2.SimpleBlobDetector_create(blob_params)
+        params['flags'] = cv2.CALIB_CB_SYMMETRIC_GRID
+    elif board_type == 'ring_circles':
+        # 白底空心圆参数
+        blob_params = cv2.SimpleBlobDetector_Params()
+        blob_params.filterByArea = True
+        blob_params.minArea = 50
+        blob_params.maxArea = 5000
+        blob_params.filterByCircularity = True
+        blob_params.minCircularity = 0.7
+        blob_params.filterByConvexity = True
+        blob_params.minConvexity = 0.8
+        blob_params.filterByInertia = True
+        blob_params.minInertiaRatio = 0.7
+        params['detector'] = cv2.SimpleBlobDetector_create(blob_params)
+        params['flags'] = cv2.CALIB_CB_SYMMETRIC_GRID + cv2.CALIB_CB_CLUSTERING
+
+    return params
+
+def preprocess_image_for_board(image: np.ndarray, board_type: str) -> np.ndarray:
+    """
+    根据标定板类型优化图像预处理
+
     参数:
         image: 输入图像
         board_type: 标定板类型
+
+    返回:
+        处理后的灰度图像
+    """
+    # 转换为灰度图
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+
+    if board_type == 'chessboard':
+        # 基本处理，提高对比度
+        gray = cv2.equalizeHist(gray)
+    elif board_type == 'circles':
+        # 增强圆形检测
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    elif board_type == 'ring_circles':
+        # 空心圆环特殊处理
+        gray = cv2.bitwise_not(gray)  # 反转图像使圆环区域为暗色
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    return gray
+
+def detect_calibration_board(image: np.ndarray, board_type: str, chessboard_size: Tuple[int, int],
+                           square_size: float) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    检测标定板角点
+
+    参数:
+        image: 输入图像
+        board_type: 标定板类型 ('chessboard'=棋盘格, 'circles'=圆形标定板, 'ring_circles'=环形标定板)
         chessboard_size: 棋盘格尺寸 (宽, 高)
         square_size: 方格大小(mm)
-        
+
     返回:
         obj_points: 3D物体点
         corners: 2D图像点
@@ -109,36 +179,45 @@ def detect_calibration_board(image: np.ndarray, board_type: str, chessboard_size
     objp = np.zeros((chessboard_size[0] * chessboard_size[1], 3), np.float32)
     objp[:, :2] = np.mgrid[0:chessboard_size[0], 0:chessboard_size[1]].T.reshape(-1, 2)
     objp *= square_size
-    
-    # 转换为灰度图
-    if len(image.shape) == 3:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image
-    
+
+    # 获取检测参数
+    detection_params = configure_detection_parameters(board_type)
+
+    # 应用优化的图像预处理
+    gray = preprocess_image_for_board(image, board_type)
+
     if board_type == 'chessboard':
         # 检测棋盘格角点
         ret, corners = cv2.findChessboardCorners(gray, chessboard_size, None)
-        
+
         if ret:
             # 亚像素精度优化
-            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+            criteria = detection_params['criteria']
             corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
             return objp, corners
-    
-    elif board_type == 'circles':
-        # 检测圆形标定板
-        ret, corners = cv2.findCirclesGrid(gray, chessboard_size, None)
+
+    elif board_type in ['circles', 'ring_circles']:
+        # 检测圆形标定板（使用与camera_calibration.py相同的方法）
+        print(f"  - 检测{board_type}类型标定板...")
+
+        # 获取圆形检测器和标志
+        blob_detector = detection_params['detector']
+        flags = detection_params['flags']
+
+        # 使用findCirclesGrid检测圆形网格
+        ret, corners = cv2.findCirclesGrid(
+            image=gray,
+            patternSize=chessboard_size,
+            flags=flags,
+            blobDetector=blob_detector
+        )
+
         if ret:
+            print(f"  - 成功检测到 {len(corners)} 个圆形角点")
             return objp, corners
-    
-    elif board_type == 'ring_circles':
-        # 检测环形圆标定板
-        ret, corners = cv2.findCirclesGrid(gray, chessboard_size, 
-                                         cv2.CALIB_CB_ASYMMETRIC_GRID)
-        if ret:
-            return objp, corners
-    
+        else:
+            print(f"  - {board_type}标定板检测失败，请检查图像质量和参数设置")
+
     return None, None
 
 
@@ -169,13 +248,17 @@ def assess_calibration_quality(reprojection_error: float, board_type: str):
         if board_type == 'chessboard':
             print("- 检查棋盘格是否平整无变形")
             print("- 尝试在更均匀的光照条件下拍摄")
+            print("- 确保黑白方格对比度足够")
         elif board_type == 'circles':
             print("- 检查圆点是否清晰可见")
             print("- 尝试调整照明减少反光")
+            print("- 确保黑色圆形与白色背景对比度足够")
         elif board_type == 'ring_circles':
-            print("- 确保圆环闭合且形状规则")
-            print("- 考虑增加图像对比度")
-        
+            print("- 确保白色圆形在白色背景上有足够的边缘对比度")
+            print("- 考虑增加图像对比度或调整照明角度")
+            print("- 检查圆形是否完整且形状规则")
+            print("- 如果检测失败，可能需要调整图像预处理参数")
+
         print("- 尝试增加标定图像数量，覆盖更多角度和位置")
         print("- 确保标定板在图像中清晰可见且无模糊")
 
@@ -960,8 +1043,9 @@ def main():
     parser.add_argument('--output_folder', type=str, help='输出文件夹路径')
     
     # 标定板参数
-    parser.add_argument('--board_type', type=str, default='chessboard', 
-                       choices=['chessboard', 'circles', 'ring_circles'], help='标定板类型')
+    parser.add_argument('--board_type', type=str, default='chessboard',
+                       choices=['chessboard', 'circles', 'ring_circles'],
+                       help='标定板类型: chessboard=棋盘格, circles=圆形标定板(黑色圆形), ring_circles=环形标定板(白色圆形在白色背景)')
     parser.add_argument('--chessboard_width', type=int, default=9, help='棋盘格宽度（内角点数）')
     parser.add_argument('--chessboard_height', type=int, default=6, help='棋盘格高度（内角点数）')
     parser.add_argument('--square_size', type=float, default=20.0, help='方格尺寸(mm)')
