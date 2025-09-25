@@ -426,8 +426,8 @@ def _improved_connectivity_optimization(mask):
 
 def _ensure_projection_integrity(mask):
     """
-    确保投影区域的完整性
-    投影仪投影时是一个完整的面，不应该有内部空洞
+    确保投影区域的完整性和边界平滑性
+    投影仪投影时是一个完整的面，不应该有内部空洞，且边界应该相对平滑
     """
     mask = mask.astype(np.uint8)
     
@@ -445,8 +445,17 @@ def _ensure_projection_integrity(mask):
     max_area_idx = np.argmax(areas) + 1
     main_projection = (labels == max_area_idx).astype(np.uint8)
     
-    # 2. 计算主投影区域的凸包
-    contours, _ = cv.findContours(main_projection, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+    # 2. 边界平滑处理
+    # 使用形态学开运算和闭运算来平滑边界
+    kernel_smooth = cv.getStructuringElement(cv.MORPH_ELLIPSE, (7, 7))
+    
+    # 先进行闭运算填充小的凹陷
+    smoothed = cv.morphologyEx(main_projection, cv.MORPH_CLOSE, kernel_smooth)
+    # 再进行开运算去除小的突起
+    smoothed = cv.morphologyEx(smoothed, cv.MORPH_OPEN, kernel_smooth)
+    
+    # 3. 计算主投影区域的凸包（用于参考）
+    contours, _ = cv.findContours(smoothed, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
     
     if len(contours) == 0:
         return mask
@@ -457,38 +466,42 @@ def _ensure_projection_integrity(mask):
     # 计算凸包
     hull = cv.convexHull(main_contour)
     
-    # 3. 创建凸包掩膜
+    # 4. 创建凸包掩膜
     hull_mask = np.zeros_like(mask)
     cv.fillPoly(hull_mask, [hull], 255)
     
-    # 4. 使用凸包和原始掩膜的交集，但填充内部空洞
-    # 先用原始掩膜，然后在凸包范围内填充所有空洞
-    combined_mask = mask.copy()
+    # 5. 渐进式边界平滑
+    # 使用多次小幅度的形态学操作来逐步平滑边界
+    final_mask = smoothed.copy()
     
-    # 在凸包区域内，填充所有空洞
-    hull_bool = hull_mask > 0
-    
-    # 使用形态学操作填充凸包内的空洞
-    kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5))
-    filled_in_hull = cv.morphologyEx(main_projection, cv.MORPH_CLOSE, kernel)
-    
-    # 进一步填充空洞
-    filled_in_hull = morphology.remove_small_holes(filled_in_hull.astype(bool), area_threshold=1000)
-    
-    # 5. 创建最终掩膜：在凸包范围内使用填充后的掩膜
-    final_mask = mask.copy()
-    
-    # 在凸包区域内，如果原掩膜有投影区域，则填充该区域的所有空洞
-    if np.any(main_projection):
-        # 创建一个膨胀的版本来填充空洞
-        dilated = cv.dilate(main_projection, kernel, iterations=3)
-        eroded = cv.erode(dilated, kernel, iterations=2)
+    # 多次小幅度的平滑操作
+    for i in range(3):
+        kernel_size = 3 + i * 2  # 逐渐增大核大小 (3, 5, 7)
+        kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (kernel_size, kernel_size))
         
-        # 只在凸包范围内应用
-        final_mask = np.where(hull_bool, np.maximum(final_mask, eroded), final_mask)
+        # 轻微的闭运算
+        temp = cv.morphologyEx(final_mask, cv.MORPH_CLOSE, kernel)
+        
+        # 只在凸包范围内应用平滑
+        final_mask = np.where(hull_mask > 0, temp, final_mask)
     
-    # 6. 最后一次空洞填充
-    final_mask = morphology.remove_small_holes(final_mask.astype(bool), area_threshold=2000)
+    # 6. 填充内部空洞
+    final_mask = morphology.remove_small_holes(final_mask.astype(bool), area_threshold=1000)
+    
+    # 7. 最终边界优化：使用高斯模糊 + 阈值化来进一步平滑边界
+    # 将二值掩膜转换为浮点数
+    float_mask = final_mask.astype(np.float32)
+    
+    # 应用轻微的高斯模糊
+    blurred = cv.GaussianBlur(float_mask, (5, 5), 1.0)
+    
+    # 重新二值化，使用稍低的阈值以保持区域大小
+    _, final_mask = cv.threshold(blurred, 0.3, 1.0, cv.THRESH_BINARY)
+    
+    # 8. 最后一次连通性检查和小区域清理
+    final_mask = final_mask.astype(np.uint8)
+    final_mask = morphology.remove_small_objects(final_mask.astype(bool), min_size=500)
+    final_mask = morphology.remove_small_holes(final_mask, area_threshold=2000)
     
     return final_mask.astype(np.uint8)
 
@@ -707,15 +720,16 @@ class multi_phase():
 
     
 
-    def decode_phase(self, image):
+    def decode_phase(self, image, direction_hint=None):
         """
-        N步相移算法解码相位（在掩膜约束下进行）
+        N步相移算法解码相位（在掩膜约束下进行，支持密集条纹处理）
         
         使用正弦和余弦项计算相移图像的包裹相位，并计算幅值和偏移量
         只在掩膜区域内进行计算，掩膜外区域设为0
         
         参数:
             image: ndarray，相移图像组，形状为[step, height, width]
+            direction_hint: str，方向提示 ('horizontal' 或 'vertical')，用于密集条纹检测
             
         返回:
             result: ndarray，归一化的包裹相位图，掩膜外区域为0
@@ -743,6 +757,17 @@ class multi_phase():
             if isinstance(image, list):
                 image = np.array(image, dtype=np.float32)
         
+        # 预处理：对于密集条纹进行特殊处理
+        if direction_hint == 'vertical':
+            # 检测是否为密集条纹
+            if self._is_dense_fringe(image):
+                print("检测到密集垂直条纹，应用特殊预处理...")
+                image = self._preprocess_dense_fringe(image, direction='vertical')
+        elif direction_hint == 'horizontal':
+            if self._is_dense_fringe(image):
+                print("检测到密集水平条纹，应用特殊预处理...")
+                image = self._preprocess_dense_fringe(image, direction='horizontal')
+        
         # 计算正弦项(分子)和余弦项(分母)
         molecule = np.sum(image*np.sin(temp), axis=0)      # 正弦项
         denominator = np.sum(image*np.cos(temp), axis=0)   # 余弦项
@@ -757,6 +782,12 @@ class multi_phase():
         # 归一化相位至[0,1]区间并减去初始相位
         result = (result+np.pi)/(2*np.pi)-self.ph0
         
+        # 密集条纹的后处理
+        if direction_hint in ['vertical', 'horizontal'] and hasattr(self, '_dense_fringe_detected'):
+            if self._dense_fringe_detected:
+                print(f"对{direction_hint}方向密集条纹进行后处理...")
+                result = self._postprocess_dense_fringe(result, direction=direction_hint)
+        
         # 确保掩膜外区域为0
         if self.use_mask:
             result[~self.mask] = 0
@@ -764,6 +795,239 @@ class multi_phase():
             offset[~self.mask] = 0
 
         return result, amp, offset
+
+    def _is_dense_fringe(self, images):
+        """
+        检测是否为密集条纹
+        
+        参数:
+            images: 相移图像数组
+            
+        返回:
+            bool: 是否为密集条纹
+        """
+        # 计算第一张图像的梯度
+        first_img = images[0] if len(images.shape) == 3 else images
+        
+        # 计算图像梯度
+        grad_y, grad_x = np.gradient(first_img.astype(np.float32))
+        gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+        
+        # 在掩膜区域内计算梯度统计
+        if self.use_mask and np.sum(self.mask) > 0:
+            valid_gradients = gradient_magnitude[self.mask]
+        else:
+            valid_gradients = gradient_magnitude.flatten()
+        
+        # 计算梯度统计量
+        grad_mean = np.mean(valid_gradients)
+        grad_std = np.std(valid_gradients)
+        grad_max = np.max(valid_gradients)
+        
+        # 密集条纹判断标准
+        # 1. 高梯度均值（条纹变化频繁）
+        # 2. 高梯度标准差（条纹对比度大）
+        # 3. 高最大梯度（存在急剧变化）
+        
+        is_dense = (grad_mean > 15.0) or (grad_std > 20.0) or (grad_max > 100.0)
+        
+        if is_dense:
+            print(f"密集条纹检测: 梯度均值={grad_mean:.2f}, 标准差={grad_std:.2f}, 最大值={grad_max:.2f}")
+            self._dense_fringe_detected = True
+        else:
+            self._dense_fringe_detected = False
+            
+        return is_dense
+
+    def _preprocess_dense_fringe(self, images, direction='vertical'):
+        """
+        密集条纹预处理
+        
+        参数:
+            images: 相移图像数组
+            direction: 条纹方向
+            
+        返回:
+            processed_images: 预处理后的图像
+        """
+        processed_images = images.copy()
+        
+        # 对于密集条纹，应用更强的预滤波
+        for i in range(processed_images.shape[0]):
+            img = processed_images[i]
+            
+            # 1. 双边滤波，保持边缘的同时平滑噪声
+            filtered = cv.bilateralFilter(
+                img.astype(np.float32), 
+                d=7,              # 邻域直径
+                sigmaColor=15.0,  # 颜色空间滤波器sigma
+                sigmaSpace=15.0   # 坐标空间滤波器sigma
+            )
+            
+            # 2. 根据方向应用定向滤波
+            if direction == 'vertical':
+                # 对于垂直条纹，在水平方向应用更强的平滑
+                kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (7, 3))  # 水平方向更宽
+            else:
+                # 对于水平条纹，在垂直方向应用更强的平滑
+                kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (3, 7))  # 垂直方向更高
+            
+            # 应用形态学滤波
+            opened = cv.morphologyEx(filtered, cv.MORPH_OPEN, kernel)
+            closed = cv.morphologyEx(opened, cv.MORPH_CLOSE, kernel)
+            
+            # 3. 混合原始图像和滤波结果
+            # 对于密集条纹，使用更多的滤波结果
+            processed_images[i] = img * 0.3 + closed * 0.7
+        
+        return processed_images
+
+    def _postprocess_dense_fringe(self, phase, direction='vertical'):
+        """
+        密集条纹后处理
+        
+        参数:
+            phase: 解码后的相位图
+            direction: 条纹方向
+            
+        返回:
+            processed_phase: 后处理后的相位图
+        """
+        processed_phase = phase.copy()
+        
+        # 1. 强化的平滑处理
+        if direction == 'vertical':
+            # 垂直条纹：在水平方向应用更强的平滑
+            kernel_size = (9, 5)  # 水平方向更宽
+            sigma_x, sigma_y = 3.0, 1.5
+        else:
+            # 水平条纹：在垂直方向应用更强的平滑
+            kernel_size = (5, 9)  # 垂直方向更高
+            sigma_x, sigma_y = 1.5, 3.0
+        
+        # 应用高斯滤波
+        smoothed = cv.GaussianBlur(processed_phase, kernel_size, sigmaX=sigma_x, sigmaY=sigma_y)
+        
+        # 2. 检测和修复相位跳跃
+        # 计算相位梯度
+        grad_y, grad_x = np.gradient(processed_phase)
+        gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+        
+        # 在掩膜区域内检测异常跳跃
+        if self.use_mask and np.sum(self.mask) > 0:
+            valid_gradients = gradient_magnitude[self.mask]
+            grad_threshold = np.percentile(valid_gradients, 90)  # 使用90%分位数作为阈值
+        else:
+            grad_threshold = np.percentile(gradient_magnitude, 90)
+        
+        # 检测跳跃点
+        jump_mask = (gradient_magnitude > grad_threshold * 1.5) & self.mask if self.use_mask else (gradient_magnitude > grad_threshold * 1.5)
+        
+        if np.sum(jump_mask) > 0:
+            print(f"检测到 {np.sum(jump_mask)} 个{direction}方向的相位跳跃点，正在修复...")
+            
+            # 使用平滑结果替换跳跃点
+            processed_phase[jump_mask] = smoothed[jump_mask]
+        
+        # 3. 最终的轻度平滑
+        final_smoothed = cv.GaussianBlur(processed_phase, (3, 3), 1.0)
+        
+        # 混合处理结果
+        processed_phase = processed_phase * 0.8 + final_smoothed * 0.2
+        
+        # 确保掩膜外区域为0
+        if self.use_mask:
+            processed_phase[~self.mask] = 0
+            
+        return processed_phase
+
+    def _adaptive_frequency_adjustment(self, direction='vertical'):
+        """
+        根据密集条纹情况自适应调整有效频率
+        
+        参数:
+            direction: 方向 ('vertical' 或 'horizontal')
+            
+        返回:
+            adjusted_frequencies: 调整后的频率列表
+        """
+        if not hasattr(self, '_dense_fringe_detected') or not self._dense_fringe_detected:
+            return self.f  # 如果没有检测到密集条纹，使用原始频率
+        
+        print(f"为{direction}方向的密集条纹调整频率...")
+        
+        # 对于密集条纹，降低有效频率以避免欠采样
+        original_frequencies = self.f.copy()
+        adjusted_frequencies = []
+        
+        for freq in original_frequencies:
+            # 根据条纹密度调整频率
+            # 对于密集条纹，使用较低的有效频率
+            adjusted_freq = max(freq * 0.6, freq - 20)  # 降低40%或减少20，取较大值
+            adjusted_frequencies.append(adjusted_freq)
+        
+        print(f"原始频率: {original_frequencies}")
+        print(f"调整后频率: {adjusted_frequencies}")
+        
+        return adjusted_frequencies
+
+    def _enhanced_phase_unwrapping_for_dense_fringe(self, phase_high, phase_mid, phase_low, 
+                                                   frequencies, direction='vertical'):
+        """
+        针对密集条纹的增强相位解包裹
+        
+        参数:
+            phase_high, phase_mid, phase_low: 高、中、低频相位图
+            frequencies: 频率列表
+            direction: 方向提示
+            
+        返回:
+            unwrapped_phase: 解包裹后的相位图
+        """
+        print(f"对{direction}方向应用增强的密集条纹解包裹...")
+        
+        # 1. 使用更保守的频率差值
+        f_high, f_mid, f_low = frequencies
+        
+        # 计算调整后的频率差
+        f12_adjusted = max(f_high - f_mid, (f_high - f_mid) * 0.8)  # 减小频率差以提高稳定性
+        f23_adjusted = max(f_mid - f_low, (f_mid - f_low) * 0.8)
+        
+        # 2. 强化的相位差计算
+        phase_12 = self.phase_diff(phase_high, phase_mid)
+        phase_23 = self.phase_diff(phase_mid, phase_low)
+        phase_123 = self.phase_diff(phase_12, phase_23)
+        
+        # 3. 对最低频相位应用更强的平滑
+        if direction == 'vertical':
+            # 垂直条纹：水平方向更强平滑
+            phase_123 = cv.GaussianBlur(phase_123, (9, 5), sigmaX=2.0, sigmaY=1.0)
+        else:
+            # 水平条纹：垂直方向更强平滑
+            phase_123 = cv.GaussianBlur(phase_123, (5, 9), sigmaX=1.0, sigmaY=2.0)
+        
+        # 4. 使用调整后的频率进行解包裹
+        unwarp_phase_12 = self.unwarpphase(phase_123, phase_12, 1, f12_adjusted)
+        unwarp_phase_23 = self.unwarpphase(phase_123, phase_23, 1, f23_adjusted)
+        
+        # 5. 展开中频相位
+        unwarp_phase2_12 = self.unwarpphase(unwarp_phase_12, phase_mid, f12_adjusted, f_mid)
+        unwarp_phase2_23 = self.unwarpphase(unwarp_phase_23, phase_mid, f23_adjusted, f_mid)
+        
+        # 6. 取加权平均而不是简单平均
+        # 对于密集条纹，给予更稳定的路径更高权重
+        weight_12 = 0.4  # 高-中频路径权重
+        weight_23 = 0.6  # 中-低频路径权重（通常更稳定）
+        
+        unwrap_phase = (unwarp_phase2_12 * weight_12 + unwarp_phase2_23 * weight_23)
+        
+        # 7. 归一化
+        unwrap_phase /= f_mid
+        
+        # 8. 针对密集条纹的后处理
+        unwrap_phase = self._postprocess_dense_fringe(unwrap_phase, direction)
+        
+        return unwrap_phase
     
     def phase_diff(self, image1, image2):
         """
@@ -790,7 +1054,7 @@ class multi_phase():
 
     def unwarpphase(self, reference, phase, reference_f, phase_f):
         """
-        基于低频参考相位展开高频相位（在掩膜约束下进行）
+        改进的基于低频参考相位展开高频相位（在掩膜约束下进行）
         
         参数:
             reference: 参考(低频)相位图
@@ -810,15 +1074,36 @@ class multi_phase():
         k = np.round(temp-phase)
         unwarp_phase = phase + k
         
-        # 高斯滤波去噪，检测错误跳变点
-        # 使用更小的高斯核以保留更多细节
-        gauss_size = (3, 3)
-        unwarp_phase_noise = unwarp_phase - cv.GaussianBlur(unwarp_phase, gauss_size, 0)
-        unwarp_reference_noise = temp - cv.GaussianBlur(temp, gauss_size, 0)
+        # 改进的噪声处理：使用自适应的高斯滤波
+        # 根据相位梯度自适应选择滤波强度
+        phase_gradient = np.sqrt(np.gradient(unwarp_phase)[0]**2 + np.gradient(unwarp_phase)[1]**2)
+        gradient_percentile = np.percentile(phase_gradient[self.mask], 75) if self.use_mask else np.percentile(phase_gradient, 75)
+        
+        # 对于梯度较大的区域使用较大的滤波核
+        if gradient_percentile > 0.5:
+            gauss_size = (5, 5)
+            sigma = 1.0
+        else:
+            gauss_size = (3, 3)
+            sigma = 0.8
+        
+        unwarp_phase_noise = unwarp_phase - cv.GaussianBlur(unwarp_phase, gauss_size, sigma)
+        unwarp_reference_noise = temp - cv.GaussianBlur(temp, gauss_size, sigma)
 
-        # 改进异常点检测：降低阈值，增加相对比例判断
-        noise_ratio = np.abs(unwarp_phase_noise) / (np.abs(unwarp_reference_noise) + 0.001)  # 避免除零
-        order_flag = (np.abs(unwarp_phase_noise) - np.abs(unwarp_reference_noise) > 0.15) & (noise_ratio > 1.5)
+        # 改进异常点检测：使用自适应阈值
+        if self.use_mask:
+            noise_std = np.std(unwarp_phase_noise[self.mask])
+            ref_noise_std = np.std(unwarp_reference_noise[self.mask])
+        else:
+            noise_std = np.std(unwarp_phase_noise)
+            ref_noise_std = np.std(unwarp_reference_noise)
+        
+        # 动态调整检测阈值
+        adaptive_threshold = min(0.25, max(0.08, noise_std * 2.5))
+        noise_ratio = np.abs(unwarp_phase_noise) / (np.abs(unwarp_reference_noise) + 0.001)
+        
+        # 更宽松的异常点检测条件
+        order_flag = (np.abs(unwarp_phase_noise) - np.abs(unwarp_reference_noise) > adaptive_threshold) & (noise_ratio > 2.0)
         
         # 只在掩膜区域内检测异常点
         if self.use_mask:
@@ -836,9 +1121,10 @@ class multi_phase():
             # 应用修复结果
             unwarp_phase[order_flag] = unwarp_error
             
-            # 第二次高斯滤波去噪，进一步检测剩余的错误跳变点
-            unwarp_phase_noise = unwarp_phase - cv.GaussianBlur(unwarp_phase, gauss_size, 0)
-            order_flag2 = np.abs(unwarp_phase_noise) > 0.2
+            # 第二次检测：使用更严格的阈值检测剩余异常点
+            unwarp_phase_noise2 = unwarp_phase - cv.GaussianBlur(unwarp_phase, gauss_size, sigma)
+            adaptive_threshold2 = min(0.35, max(0.15, noise_std * 3.0))
+            order_flag2 = np.abs(unwarp_phase_noise2) > adaptive_threshold2
             
             # 只在掩膜区域内检测异常点
             if self.use_mask:
@@ -846,7 +1132,7 @@ class multi_phase():
             
             if np.sum(order_flag2) > 0:
                 unwarp_error2 = unwarp_phase[order_flag2]
-                unwarp_error_direct2 = unwarp_phase_noise[order_flag2]
+                unwarp_error_direct2 = unwarp_phase_noise2[order_flag2]
                 
                 # 根据噪声方向调整条纹序数
                 unwarp_error2[unwarp_error_direct2 > 0] -= 1  # 正向噪声减少一个周期
@@ -861,6 +1147,254 @@ class multi_phase():
 
         return unwarp_phase
 
+    def post_process_phase(self, unwrap_phase, quality_map=None):
+        """
+        增强的后处理步骤：改善相位连续性和去除异常值，特别针对断层问题
+        
+        参数:
+            unwrap_phase: 解包裹后的相位图
+            quality_map: 相位质量图（可选）
+            
+        返回:
+            processed_phase: 处理后的相位图
+        """
+        if not self.use_mask:
+            return unwrap_phase
+            
+        processed_phase = unwrap_phase.copy()
+        
+        # 1. 检测和修复断层问题
+        processed_phase = self._repair_phase_discontinuities(processed_phase, quality_map)
+        
+        # 2. 基于质量图的自适应平滑
+        if quality_map is not None:
+            processed_phase = self._adaptive_quality_smoothing(processed_phase, quality_map)
+        else:
+            # 没有质量图时使用保边平滑
+            processed_phase = self._edge_preserving_smoothing(processed_phase)
+        
+        # 3. 检测和修复孤立异常点
+        processed_phase = self._repair_outliers(processed_phase)
+        
+        # 4. 边界平滑处理
+        processed_phase = self._smooth_boundaries(processed_phase)
+        
+        # 5. 最终确保掩膜外区域为0
+        processed_phase[~self.mask] = 0
+        
+        return processed_phase
+
+    def _repair_phase_discontinuities(self, phase, quality_map=None):
+        """
+        检测和修复相位断层问题
+        
+        参数:
+            phase: 相位图
+            quality_map: 质量图（可选）
+            
+        返回:
+            repaired_phase: 修复后的相位图
+        """
+        repaired_phase = phase.copy()
+        
+        # 1. 检测大的相位跳跃（可能的断层）
+        # 计算相位梯度
+        grad_y, grad_x = np.gradient(repaired_phase)
+        gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+        
+        # 在掩膜区域内计算梯度统计
+        if np.sum(self.mask) > 0:
+            valid_gradients = gradient_magnitude[self.mask]
+            grad_mean = np.mean(valid_gradients)
+            grad_std = np.std(valid_gradients)
+            
+            # 使用更严格的阈值检测断层
+            discontinuity_threshold = grad_mean + 4.0 * grad_std  # 4-sigma规则
+            discontinuity_mask = (gradient_magnitude > discontinuity_threshold) & self.mask
+            
+            if np.sum(discontinuity_mask) > 0:
+                print(f"检测到 {np.sum(discontinuity_mask)} 个可能的断层点，正在修复...")
+                
+                # 2. 使用形态学方法修复断层
+                # 膨胀断层检测区域
+                kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5))
+                expanded_discontinuity = cv.dilate(discontinuity_mask.astype(np.uint8), kernel)
+                expanded_discontinuity = expanded_discontinuity.astype(bool) & self.mask
+                
+                # 3. 使用双边滤波修复断层区域
+                # 双边滤波能保持边缘的同时平滑噪声
+                bilateral_filtered = cv.bilateralFilter(
+                    repaired_phase.astype(np.float32), 
+                    d=9,           # 像素邻域直径
+                    sigmaColor=0.1,  # 颜色空间滤波器的sigma值
+                    sigmaSpace=2.0   # 坐标空间滤波器的sigma值
+                )
+                
+                # 4. 在断层区域应用修复
+                if quality_map is not None:
+                    # 使用质量图加权混合
+                    quality_weights = quality_map / (np.max(quality_map) + 1e-8)
+                    quality_weights = np.clip(quality_weights, 0.1, 1.0)
+                    
+                    # 低质量区域更多地使用滤波结果
+                    blend_factor = np.clip(1 - quality_weights, 0.3, 0.9)
+                    repaired_phase[expanded_discontinuity] = (
+                        repaired_phase[expanded_discontinuity] * (1 - blend_factor[expanded_discontinuity]) +
+                        bilateral_filtered[expanded_discontinuity] * blend_factor[expanded_discontinuity]
+                    )
+                else:
+                    # 在断层区域直接使用双边滤波结果
+                    repaired_phase[expanded_discontinuity] = bilateral_filtered[expanded_discontinuity]
+                
+                # 5. 使用inpainting进一步修复严重断层
+                severe_discontinuity = gradient_magnitude > (grad_mean + 6.0 * grad_std)
+                severe_discontinuity = severe_discontinuity & self.mask
+                
+                if np.sum(severe_discontinuity) > 0:
+                    # 使用OpenCV的inpainting算法修复严重断层
+                    inpaint_mask = severe_discontinuity.astype(np.uint8) * 255
+                    inpainted = cv.inpaint(
+                        (repaired_phase * 255).astype(np.uint8),
+                        inpaint_mask,
+                        inpaintRadius=3,
+                        flags=cv.INPAINT_TELEA
+                    )
+                    inpainted = inpainted.astype(np.float32) / 255.0
+                    
+                    # 只在严重断层区域应用inpainting结果
+                    repaired_phase[severe_discontinuity] = inpainted[severe_discontinuity]
+        
+        return repaired_phase
+
+    def _adaptive_quality_smoothing(self, phase, quality_map):
+        """
+        基于质量图的自适应平滑
+        """
+        # 使用质量图作为权重进行加权平滑
+        weights = quality_map / (np.max(quality_map) + 1e-8)
+        weights[~self.mask] = 0
+        
+        # 多尺度平滑
+        smoothed_phase = phase.copy()
+        
+        for scale in [3, 5, 7]:  # 不同尺度的平滑
+            kernel_size = (scale, scale)
+            sigma = scale / 3.0
+            
+            smoothed = cv.GaussianBlur(smoothed_phase, kernel_size, sigma)
+            
+            # 根据质量权重和尺度调整混合因子
+            scale_factor = scale / 7.0  # 归一化尺度因子
+            blend_factor = np.clip((1 - weights) * scale_factor, 0.05, 0.3)
+            
+            smoothed_phase = smoothed_phase * (1 - blend_factor) + smoothed * blend_factor
+            smoothed_phase[~self.mask] = 0
+        
+        return smoothed_phase
+
+    def _edge_preserving_smoothing(self, phase):
+        """
+        保边平滑算法
+        """
+        # 使用双边滤波进行保边平滑
+        smoothed = cv.bilateralFilter(
+            phase.astype(np.float32),
+            d=7,
+            sigmaColor=0.05,
+            sigmaSpace=1.5
+        )
+        
+        # 轻微混合以保持原始细节
+        result = phase * 0.7 + smoothed * 0.3
+        result[~self.mask] = 0
+        
+        return result
+
+    def _repair_outliers(self, phase):
+        """
+        检测和修复孤立异常点
+        """
+        # 使用多种滤波器检测异常点
+        median_filtered = cv.medianBlur(phase.astype(np.float32), 5)
+        gaussian_filtered = cv.GaussianBlur(phase, (5, 5), 1.0)
+        
+        # 计算与两种滤波结果的差异
+        median_diff = np.abs(phase - median_filtered)
+        gaussian_diff = np.abs(phase - gaussian_filtered)
+        
+        # 在掩膜区域内计算异常点阈值
+        if np.sum(self.mask) > 0:
+            median_threshold = np.percentile(median_diff[self.mask], 98)  # 更严格的阈值
+            gaussian_threshold = np.percentile(gaussian_diff[self.mask], 98)
+            
+            # 同时满足两个条件才认为是异常点
+            outlier_mask = (median_diff > median_threshold) & (gaussian_diff > gaussian_threshold) & self.mask
+            
+            if np.sum(outlier_mask) > 0:
+                print(f"检测到 {np.sum(outlier_mask)} 个异常点，正在修复...")
+                # 使用中值滤波结果替换异常点
+                phase[outlier_mask] = median_filtered[outlier_mask]
+        
+        return phase
+
+    def _smooth_boundaries(self, phase):
+        """
+        边界平滑处理
+        """
+        # 对掩膜边界附近的区域进行额外平滑
+        boundary_mask = self._get_boundary_mask(boundary_width=8)  # 增加边界宽度
+        
+        if np.sum(boundary_mask) > 0:
+            # 使用更强的平滑
+            boundary_smoothed = cv.GaussianBlur(phase, (9, 9), 2.0)
+            
+            # 在边界区域逐渐混合
+            # 计算到边界的距离，用于渐变混合
+            distance_transform = cv.distanceTransform(
+                (~self.mask).astype(np.uint8), 
+                cv.DIST_L2, 
+                5
+            )
+            
+            # 归一化距离，用于计算混合权重
+            max_dist = np.max(distance_transform[boundary_mask])
+            if max_dist > 0:
+                normalized_dist = distance_transform / max_dist
+                # 距离边界越近，使用越多的平滑结果
+                blend_factor = np.clip(1 - normalized_dist, 0.1, 0.6)
+                
+                phase[boundary_mask] = (
+                    phase[boundary_mask] * (1 - blend_factor[boundary_mask]) + 
+                    boundary_smoothed[boundary_mask] * blend_factor[boundary_mask]
+                )
+        
+        return phase
+    
+    def _get_boundary_mask(self, boundary_width=5):
+        """
+        获取掩膜边界区域
+        
+        参数:
+            boundary_width: 边界宽度（像素）
+            
+        返回:
+            boundary_mask: 边界区域掩膜
+        """
+        if not self.use_mask:
+            return np.zeros_like(self.mask, dtype=bool)
+            
+        # 膨胀和腐蚀操作来获取边界
+        kernel = np.ones((boundary_width*2+1, boundary_width*2+1), np.uint8)
+        dilated = cv.dilate(self.mask.astype(np.uint8), kernel, iterations=1)
+        eroded = cv.erode(self.mask.astype(np.uint8), kernel, iterations=1)
+        
+        # 边界是膨胀后减去腐蚀后的区域
+        boundary = (dilated - eroded) > 0
+        
+        # 只保留在原始掩膜内的边界
+        boundary = boundary & self.mask
+        
+        return boundary
     
     def get_phase(self):
         """
@@ -873,16 +1407,18 @@ class multi_phase():
             unwarp_phase_x: 水平方向展开的相位图
             ratio: 相位质量图(基于调制度与偏移比)
         """
-        # 1. 解码各个频率的相位
+        # 1. 解码各个频率的相位（添加方向提示以优化密集条纹处理）
+        print("开始解码垂直方向相位...")
         # 解码垂直方向的三个频率的相位
-        phase_1y,amp1_y,offset1_y = self.decode_phase(image=self.images[0:4])   # 高频
-        phase_2y,amp2_y,offset2_y = self.decode_phase(image=self.images[4:8])   # 中频
-        phase_3y,amp3_y,offset3_y = self.decode_phase(image=self.images[8:12])  # 低频
+        phase_1y,amp1_y,offset1_y = self.decode_phase(image=self.images[0:4], direction_hint='vertical')   # 高频
+        phase_2y,amp2_y,offset2_y = self.decode_phase(image=self.images[4:8], direction_hint='vertical')   # 中频
+        phase_3y,amp3_y,offset3_y = self.decode_phase(image=self.images[8:12], direction_hint='vertical')  # 低频
 
+        print("开始解码水平方向相位...")
         # 解码水平方向的三个频率的相位
-        phase_1x,amp1_x,offset1_x = self.decode_phase(image=self.images[12:16]) # 高频
-        phase_2x,amp2_x,offset2_x = self.decode_phase(image=self.images[16:20]) # 中频
-        phase_3x,amp3_x,offset3_x = self.decode_phase(image=self.images[20:24]) # 低频
+        phase_1x,amp1_x,offset1_x = self.decode_phase(image=self.images[12:16], direction_hint='horizontal') # 高频
+        phase_2x,amp2_x,offset2_x = self.decode_phase(image=self.images[16:20], direction_hint='horizontal') # 中频
+        phase_3x,amp3_x,offset3_x = self.decode_phase(image=self.images[20:24], direction_hint='horizontal') # 低频
 
         # 注释掉所有中间过程的可视化代码
         """
@@ -947,9 +1483,10 @@ class multi_phase():
         """
         #plt.show()
 
-        # 3. 平滑最低等效频率相位以提高鲁棒性
-        phase_123y = cv.GaussianBlur(phase_123y,(3,3),0)
-        phase_123x = cv.GaussianBlur(phase_123x,(3,3),0)
+        # 3. 改进的平滑处理：使用更适合的滤波参数
+        # 对最低等效频率相位进行平滑，提高鲁棒性
+        phase_123y = cv.GaussianBlur(phase_123y, (5, 5), 1.0)  # 增加滤波强度
+        phase_123x = cv.GaussianBlur(phase_123x, (5, 5), 1.0)
 
         # 4. 相位展开流程 - 自底向上展开
         # 使用最低等效频率相位(phase_123y/x)展开中等频率相位差(phase_12y/x和phase_23y/x)
@@ -1019,12 +1556,25 @@ class multi_phase():
         plt.tight_layout()
         """
 
-        # 6. 取两个展开路径的平均值以提高鲁棒性
-        unwarp_phase_y = (unwarp_phase2_y_12+unwarp_phase2_y_23)/2
+        # 6. 检查是否检测到密集条纹，并应用相应的处理策略
+        print("检查密集条纹处理需求...")
+        
+        # 检查垂直方向是否需要特殊处理
+        vertical_needs_special_processing = hasattr(self, '_dense_fringe_detected') and self._dense_fringe_detected
+        
+        if vertical_needs_special_processing:
+            print("垂直方向检测到密集条纹，应用增强解包裹策略...")
+            # 对垂直方向使用增强的密集条纹解包裹
+            unwarp_phase_y = self._enhanced_phase_unwrapping_for_dense_fringe(
+                phase_1y, phase_2y, phase_3y, self.f, direction='vertical'
+            )
+        else:
+            # 使用标准方法处理垂直方向
+            unwarp_phase_y = (unwarp_phase2_y_12+unwarp_phase2_y_23)/2
+            unwarp_phase_y/=self.f[1]  # 以中频为基准归一化
+        
+        # 水平方向通常使用标准处理（除非也检测到密集条纹）
         unwarp_phase_x = (unwarp_phase2_x_12+unwarp_phase2_x_23)/2
-
-        # 7. 归一化相位结果
-        unwarp_phase_y/=self.f[1]  # 以中频为基准归一化
         unwarp_phase_x/=self.f[1]  # 以中频为基准归一化
 
         # 注释掉所有中间过程的可视化代码
@@ -1058,6 +1608,14 @@ class multi_phase():
             unwarp_phase_x[~self.mask] = 0
             phase_2y[~self.mask] = 0
             phase_2x[~self.mask] = 0
+        
+        # 9. 应用后处理改善相位连续性
+        print("应用后处理改善相位连续性...")
+        unwarp_phase_y = self.post_process_phase(unwarp_phase_y, ratio_y)
+        unwarp_phase_x = self.post_process_phase(unwarp_phase_x, ratio_x)
+        phase_2y = self.post_process_phase(phase_2y, ratio_y)
+        phase_2x = self.post_process_phase(phase_2x, ratio_x)
+        print("后处理完成")
         
         # 注释掉所有中间过程的可视化代码
         """
