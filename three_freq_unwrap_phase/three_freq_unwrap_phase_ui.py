@@ -193,11 +193,7 @@ class UnwrappingWorker(QThread):
                     f=frequencies, 
                     step=self.phase_step, 
                     images=combined_images, 
-                    ph0=self.ph0,
-                    use_mask=self.use_mask,
-                    mask_method=self.mask_method,
-                    mask_confidence=self.mask_confidence,
-                    output_dir=self.output_dir
+                    ph0=self.ph0
                 )
             
                 # 调用get_phase()方法获取解包裹结果
@@ -238,22 +234,6 @@ class UnwrappingWorker(QThread):
             plt.ion()  # 重新开启交互模式
             
             self.progress_updated.emit(80)
-            
-            # 保存掩膜（如果使用了掩膜）
-            if self.use_mask and hasattr(processor, 'mask') and processor.mask is not None:
-                try:
-                    mask_dir = os.path.join(self.output_dir, "mask")
-                    os.makedirs(mask_dir, exist_ok=True)
-                    
-                    # 保存最终掩膜
-                    mask_img = (processor.mask.astype(np.uint8) * 255)
-                    cv.imwrite(os.path.join(mask_dir, "final_mask.png"), mask_img)
-                    
-                    # 保存掩膜特征图（如果有的话）
-                    # 这里可以保存振幅、调制度等特征图，用于调试
-                    print(f"掩膜已保存至: {mask_dir}")
-                except Exception as e:
-                    print(f"保存掩膜时出错: {e}")
             
             # 保存结果
             if process_vertical and unwarp_phase_y is not None and unwarp_phase_y.size > 0 and ratio_y is not None and ratio_y.size > 0:
