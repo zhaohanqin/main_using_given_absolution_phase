@@ -654,7 +654,8 @@ class multi_phase():
     该类实现了基于多频率条纹图像的相位解包裹算法，
     可同时处理水平和垂直方向的相位图，使用外差法逐级展开相位
     """
-    def __init__(self,f,step,images,ph0):
+    def __init__(self, f, step, images, ph0, output_dir=None, save_intermediate=True, 
+                 use_mask=False, mask_confidence=0.5):
         """
         初始化多频相位解包裹对象
         
@@ -663,13 +664,22 @@ class multi_phase():
             step: 整数，相移步数(通常为3或4)
             images: ndarray，所有条纹图像组成的数组
             ph0: 浮点数，相移初始相位偏移量
+            output_dir: 字符串，输出目录路径（可选）
+            save_intermediate: 布尔值，是否保存中间结果（默认True）
+            use_mask: 布尔值，是否使用掩膜（默认False）
+            mask_confidence: 浮点数，掩膜置信度 (0.1-0.9)，越高越严格
         """
-        self.f=f                # 频率列表
-        self.images=images      # 相移图像
-        self.step = step        # 相移步数
-        self.ph0 = ph0          # 相移初始相位
-        self.f12=f[0]-f[1]      # 第1和第2个频率的差值(高频-中频)
-        self.f23=f[1]-f[2]      # 第2和第3个频率的差值(中频-低频)
+        self.f = f                # 频率列表
+        self.images = images      # 相移图像
+        self.step = step          # 相移步数
+        self.ph0 = ph0            # 相移初始相位
+        self.f12 = f[0] - f[1]    # 第1和第2个频率的差值(高频-中频)
+        self.f23 = f[1] - f[2]    # 第2和第3个频率的差值(中频-低频)
+        self.output_dir = output_dir  # 输出目录
+        self.save_intermediate = save_intermediate  # 是否保存中间结果
+        self.use_mask = use_mask  # 是否使用掩膜
+        self.mask_confidence = mask_confidence  # 掩膜置信度
+        self.mask = None          # 掩膜数组（将在get_phase中生成）
 
     
 
@@ -1034,6 +1044,58 @@ class multi_phase():
         
         return boundary
     
+    def _save_phase_image(self, phase_data, filename, folder_name=None):
+        """
+        保存相位图像（2D可视化图）
+        
+        参数:
+            phase_data: 相位数据
+            filename: 文件名（不含路径）
+            folder_name: 子文件夹名称（可选）
+        """
+        if not self.save_intermediate or self.output_dir is None:
+            return
+            
+        # 确定保存路径
+        if folder_name:
+            save_dir = os.path.join(self.output_dir, folder_name)
+            os.makedirs(save_dir, exist_ok=True)
+        else:
+            save_dir = self.output_dir
+            
+        # 归一化相位数据到0-255范围用于显示
+        phase_normalized = cv.normalize(phase_data, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
+        
+        # 应用jet色图
+        phase_colored = cv.applyColorMap(phase_normalized, cv.COLORMAP_JET)
+        
+        # 保存图像
+        save_path = os.path.join(save_dir, filename)
+        cv.imwrite(save_path, phase_colored)
+        
+    def _save_phase_tiff(self, phase_data, filename, folder_name=None):
+        """
+        保存相位数据为TIFF格式（原始浮点数据）
+        
+        参数:
+            phase_data: 相位数据
+            filename: 文件名（不含路径）
+            folder_name: 子文件夹名称（可选）
+        """
+        if self.output_dir is None:
+            return
+            
+        # 确定保存路径
+        if folder_name:
+            save_dir = os.path.join(self.output_dir, folder_name)
+            os.makedirs(save_dir, exist_ok=True)
+        else:
+            save_dir = self.output_dir
+            
+        # 保存TIFF文件
+        save_path = os.path.join(save_dir, filename)
+        cv.imwrite(save_path, phase_data.astype(np.float32))
+    
     def get_phase(self):
         """
         多频相移解包裹主流程
@@ -1047,6 +1109,34 @@ class multi_phase():
             phase_2y: 垂直方向中频包裹相位
             phase_2x: 水平方向中频包裹相位
         """
+        # 0. 生成掩膜（如果启用）
+        if self.use_mask:
+            print(f"正在生成投影区域掩膜 (使用Otsu自适应阈值方法, 置信度: {self.mask_confidence})...")
+            
+            # 使用所有图像生成掩膜（可以使用全部24张图像以获得更好的掩膜质量）
+            all_images_list = [self.images[i] for i in range(len(self.images))]
+            
+            self.mask = generate_projection_mask_three_freq(
+                images=all_images_list,
+                algorithm=PhaseShiftingAlgorithm.four_step if self.step == 4 else PhaseShiftingAlgorithm.three_step,
+                method='otsu',  # 固定使用otsu方法
+                confidence=self.mask_confidence,
+                min_area=500,
+                border_trim_px=10,
+                save_debug_images=True,
+                output_dir=self.output_dir
+            )
+            
+            # 统计掩膜覆盖率
+            mask_coverage = np.sum(self.mask) / self.mask.size
+            print(f"掩膜生成完成，有效区域覆盖率: {mask_coverage:.1%}")
+            
+            if mask_coverage < 0.1:
+                print(f"警告: 掩膜覆盖率过低 ({mask_coverage:.1%})，建议调整掩膜参数或检查图像质量")
+        else:
+            print("未启用掩膜，将处理整个图像")
+            self.mask = None
+        
         # 1. 解码各个频率的相位
         # 解码垂直方向的三个频率的相位
         phase_1y,amp1_y,offset1_y = self.decode_phase(image=self.images[0:4])   # 高频
@@ -1057,6 +1147,28 @@ class multi_phase():
         phase_1x,amp1_x,offset1_x = self.decode_phase(image=self.images[12:16]) # 高频
         phase_2x,amp2_x,offset2_x = self.decode_phase(image=self.images[16:20]) # 中频
         phase_3x,amp3_x,offset3_x = self.decode_phase(image=self.images[20:24]) # 低频
+        
+        # 应用掩膜到包裹相位（如果启用）
+        # 注意：掩膜只需在包裹相位阶段应用一次
+        # 后续的解包裹过程是基于包裹相位的数学运算，会自动保持掩膜外区域的无效性
+        if self.use_mask and self.mask is not None:
+            print("应用掩膜到包裹相位（掩膜外区域将设为0）...")
+            # 将掩膜外的区域设置为0
+            phase_1y[~self.mask] = 0
+            phase_2y[~self.mask] = 0
+            phase_3y[~self.mask] = 0
+            phase_1x[~self.mask] = 0
+            phase_2x[~self.mask] = 0
+            phase_3x[~self.mask] = 0
+            print(f"✓ 已将掩膜外区域设为0，后续解包裹将基于这些包裹相位进行")
+        
+        # 保存包裹相位（三个频率的水平和垂直方向）
+        self._save_phase_image(phase_1y, 'phase_1y_wrapped.png', '1_wrapped_phases')
+        self._save_phase_image(phase_2y, 'phase_2y_wrapped.png', '1_wrapped_phases')
+        self._save_phase_image(phase_3y, 'phase_3y_wrapped.png', '1_wrapped_phases')
+        self._save_phase_image(phase_1x, 'phase_1x_wrapped.png', '1_wrapped_phases')
+        self._save_phase_image(phase_2x, 'phase_2x_wrapped.png', '1_wrapped_phases')
+        self._save_phase_image(phase_3x, 'phase_3x_wrapped.png', '1_wrapped_phases')
 
         # 注释掉所有中间过程的可视化代码
         """
@@ -1085,6 +1197,12 @@ class multi_phase():
         phase_12x = self.phase_diff(phase_1x,phase_2x)  # 频率1和2的差异
         phase_23x = self.phase_diff(phase_2x,phase_3x)  # 频率2和3的差异
         phase_123x = self.phase_diff(phase_12x,phase_23x) # 差异的差异(等效最低频)
+        
+        # 保存第一次多频外差结果
+        self._save_phase_image(phase_12y, 'phase_12y.png', '2_first_heterodyne')
+        self._save_phase_image(phase_23y, 'phase_23y.png', '2_first_heterodyne')
+        self._save_phase_image(phase_12x, 'phase_12x.png', '2_first_heterodyne')
+        self._save_phase_image(phase_23x, 'phase_23x.png', '2_first_heterodyne')
 
         # 注释掉所有中间过程的可视化代码
         """
@@ -1124,6 +1242,10 @@ class multi_phase():
         # 3. 平滑最低等效频率相位以提高鲁棒性
         phase_123y = cv.GaussianBlur(phase_123y,(3,3),0)
         phase_123x = cv.GaussianBlur(phase_123x,(3,3),0)
+        
+        # 保存第二次多频外差结果
+        self._save_phase_image(phase_123y, 'phase_123y.png', '3_second_heterodyne')
+        self._save_phase_image(phase_123x, 'phase_123x.png', '3_second_heterodyne')
 
         # 4. 相位展开流程 - 自底向上展开
         # 使用最低等效频率相位(phase_123y/x)展开中等频率相位差(phase_12y/x和phase_23y/x)
@@ -1132,6 +1254,12 @@ class multi_phase():
 
         unwarp_phase_12_x = self.unwarpphase(phase_123x,phase_12x,1,self.f12)
         unwarp_phase_23_x = self.unwarpphase(phase_123x,phase_23x,1,self.f23)
+        
+        # 保存相位展开流程结果
+        self._save_phase_image(unwarp_phase_12_y, 'unwarp_phase_12_y.png', '4_phase_unwrapping')
+        self._save_phase_image(unwarp_phase_23_y, 'unwarp_phase_23_y.png', '4_phase_unwrapping')
+        self._save_phase_image(unwarp_phase_12_x, 'unwarp_phase_12_x.png', '4_phase_unwrapping')
+        self._save_phase_image(unwarp_phase_23_x, 'unwarp_phase_23_x.png', '4_phase_unwrapping')
         
         # 注释掉所有中间过程的可视化代码
         """
@@ -1166,6 +1294,17 @@ class multi_phase():
 
         unwarp_phase2_x_12 = self.unwarpphase(unwarp_phase_12_x,phase_2x,self.f12,self.f[1])
         unwarp_phase2_x_23 = self.unwarpphase(unwarp_phase_23_x,phase_2x,self.f23,self.f[1])
+        
+        # 保存最终结果（2D图像和TIFF）
+        self._save_phase_image(unwarp_phase2_y_12/self.f[1], 'unwrap_phase2_y_12_2d.png', '5_final_results')
+        self._save_phase_image(unwarp_phase2_y_23/self.f[1], 'unwrap_phase2_y_23_2d.png', '5_final_results')
+        self._save_phase_image(unwarp_phase2_x_12/self.f[1], 'unwrap_phase2_x_12_2d.png', '5_final_results')
+        self._save_phase_image(unwarp_phase2_x_23/self.f[1], 'unwrap_phase2_x_23_2d.png', '5_final_results')
+        
+        self._save_phase_tiff(unwarp_phase2_y_12/self.f[1], 'unwrap_phase2_y_12.tiff', '5_final_results')
+        self._save_phase_tiff(unwarp_phase2_y_23/self.f[1], 'unwrap_phase2_y_23.tiff', '5_final_results')
+        self._save_phase_tiff(unwarp_phase2_x_12/self.f[1], 'unwrap_phase2_x_12.tiff', '5_final_results')
+        self._save_phase_tiff(unwarp_phase2_x_23/self.f[1], 'unwrap_phase2_x_23.tiff', '5_final_results')
 
         # 注释掉所有中间过程的可视化代码
         """
@@ -1200,6 +1339,13 @@ class multi_phase():
         # 7. 归一化相位结果
         unwarp_phase_y/=self.f[1]  # 以中频为基准归一化
         unwarp_phase_x/=self.f[1]  # 以中频为基准归一化
+        
+        # 注意：不需要在这里再次应用掩膜
+        # 因为包裹相位已经应用了掩膜，解包裹过程会保持掩膜外区域的无效性
+        
+        # 保存最终的水平和垂直方向解包裹相位（TIFF格式，保存在主输出目录）
+        self._save_phase_tiff(unwarp_phase_y, 'unwrapped_phase_vertical.tiff')
+        self._save_phase_tiff(unwarp_phase_x, 'unwrapped_phase_horizontal.tiff')
 
         # 注释掉所有中间过程的可视化代码
         """
@@ -1221,6 +1367,8 @@ class multi_phase():
         ratio_y = np.min([amp1_y/offset1_y,amp2_y/offset2_y,amp3_y/offset3_y],axis=0)
 
         ratio = np.min([ratio_x,ratio_y],axis=0)  # 取水平和垂直方向的最小值作为最终质量图
+        
+        # 不再保存相位质量图文件
         
         # 注释掉所有中间过程的可视化代码
         """

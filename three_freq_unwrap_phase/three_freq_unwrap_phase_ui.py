@@ -57,7 +57,6 @@ class UnwrappingWorker(QThread):
                 filter_kernel_size: int = 9,
                 unwrap_direction: UnwrapDirection = UnwrapDirection.BOTH,
                 use_mask: bool = True,
-                mask_method: str = "otsu",
                 mask_confidence: float = 0.5):
         super().__init__()
         self.output_dir = output_dir
@@ -67,7 +66,6 @@ class UnwrappingWorker(QThread):
         self.filter_kernel_size = filter_kernel_size
         self.unwrap_direction = unwrap_direction
         self.use_mask = use_mask
-        self.mask_method = mask_method
         self.mask_confidence = mask_confidence
         
     def run(self):
@@ -173,9 +171,7 @@ class UnwrappingWorker(QThread):
             if len(combined_images) != 6 * self.phase_step:
                 raise ValueError(f"组合后的图像数量不正确，应为{6 * self.phase_step}张，实际为{len(combined_images)}张")
             
-            # 保存图像信息日志，便于排错
-            with open(os.path.join(self.output_dir, "image_info.log"), "w") as f:
-                f.write("\n".join(image_info))
+            # 不再保存图像信息日志
             
             self.progress_updated.emit(30)
             
@@ -193,7 +189,11 @@ class UnwrappingWorker(QThread):
                     f=frequencies, 
                     step=self.phase_step, 
                     images=combined_images, 
-                    ph0=self.ph0
+                    ph0=self.ph0,
+                    output_dir=self.output_dir,
+                    save_intermediate=True,
+                    use_mask=self.use_mask,
+                    mask_confidence=self.mask_confidence
                 )
             
                 # 调用get_phase()方法获取解包裹结果
@@ -239,7 +239,7 @@ class UnwrappingWorker(QThread):
             if process_vertical and unwarp_phase_y is not None and unwarp_phase_y.size > 0 and ratio_y is not None and ratio_y.size > 0:
                 try:
                     cv.imwrite(os.path.join(self.output_dir, "unwrapped_phase_vertical.tiff"), unwarp_phase_y)
-                    cv.imwrite(os.path.join(self.output_dir, "phase_quality_vertical.tiff"), ratio_y)
+                    # 不再保存相位质量图
                     
                     # 保存2D伪彩色图像
                     plt.figure(figsize=(10, 8))
@@ -275,7 +275,7 @@ class UnwrappingWorker(QThread):
             if process_horizontal and unwarp_phase_x is not None and unwarp_phase_x.size > 0 and ratio_x is not None and ratio_x.size > 0:
                 try:
                     cv.imwrite(os.path.join(self.output_dir, "unwrapped_phase_horizontal.tiff"), unwarp_phase_x)
-                    cv.imwrite(os.path.join(self.output_dir, "phase_quality_horizontal.tiff"), ratio_x)
+                    # 不再保存相位质量图
                     
                     # 保存2D伪彩色图像
                     plt.figure(figsize=(10, 8))
@@ -327,41 +327,7 @@ class UnwrappingWorker(QThread):
                     traceback.print_exc()
                     print(f"保存组合相位图失败: {str(e)}")  # 不中断处理，只打印错误
             
-            # 创建水平方向的3D视图
-            if process_horizontal and unwarp_phase_x is not None and unwarp_phase_x.size > 0:
-                try:
-                    plt.figure(figsize=(10, 8))
-                    ax = plt.axes(projection='3d')
-                    h, w = unwarp_phase_x.shape
-                    X, Y = np.meshgrid(range(w), range(h))
-                    stride = 10  # 控制网格密度
-                    ax.plot_surface(X[::stride, ::stride], Y[::stride, ::stride], 
-                                    unwarp_phase_x[::stride, ::stride], cmap='jet')
-                    ax.set_title('水平方向解包裹相位3D视图')
-                    plt.savefig(os.path.join(self.output_dir, "unwrapped_phase_horizontal_3d.png"))
-                    plt.close()
-                except Exception as e:
-                    import traceback  # 确保在此作用域内导入traceback
-                    traceback.print_exc()
-                    print(f"创建水平方向3D视图失败: {str(e)}")  # 不中断处理，只打印错误
-            
-            # 创建垂直方向的3D视图
-            if process_vertical and unwarp_phase_y is not None and unwarp_phase_y.size > 0:
-                try:
-                    plt.figure(figsize=(10, 8))
-                    ax = plt.axes(projection='3d')
-                    h, w = unwarp_phase_y.shape
-                    X, Y = np.meshgrid(range(w), range(h))
-                    stride = 10  # 控制网格密度
-                    ax.plot_surface(X[::stride, ::stride], Y[::stride, ::stride], 
-                                    unwarp_phase_y[::stride, ::stride], cmap='jet')
-                    ax.set_title('垂直方向解包裹相位3D视图')
-                    plt.savefig(os.path.join(self.output_dir, "unwrapped_phase_vertical_3d.png"))
-                    plt.close()
-                except Exception as e:
-                    import traceback  # 确保在此作用域内导入traceback
-                    traceback.print_exc()
-                    print(f"创建垂直方向3D视图失败: {str(e)}")  # 不中断处理，只打印错误
+            # 不再生成3D视图，用户不需要
             
             self.progress_updated.emit(100)
             
@@ -814,7 +780,6 @@ class ThreeFreqPhaseUnwrapperUI(QMainWindow):
         
         # 掩膜相关参数
         self.use_mask = True
-        self.mask_method = "otsu"
         self.mask_confidence = 0.5
         self.permanent_status_message = "就绪"
         self.combined_viewer_window = None # 用于持有对新窗口的引用
@@ -975,28 +940,15 @@ class ThreeFreqPhaseUnwrapperUI(QMainWindow):
         settings_layout.addWidget(filter_group)
         
         # 掩膜设置
-        mask_group = QGroupBox("投影区域掩膜设置")
+        mask_group = QGroupBox("投影区域掩膜设置 (使用Otsu自适应阈值方法)")
         mask_form_layout = QFormLayout(mask_group)
         
         # 是否使用掩膜
         self.use_mask_checkbox = QCheckBox("启用投影区域掩膜")
         self.use_mask_checkbox.setChecked(self.use_mask)
-        self.use_mask_checkbox.setToolTip("启用后，只在投影有效区域内进行相位解包裹计算，避免环境干扰。")
+        self.use_mask_checkbox.setToolTip("启用后，只在投影有效区域内进行相位解包裹计算，避免环境干扰。\n使用Otsu自适应阈值方法自动识别投影区域。")
         self.use_mask_checkbox.stateChanged.connect(self.update_use_mask)
         mask_form_layout.addRow(self.use_mask_checkbox)
-        
-        # 掩膜生成方法
-        self.mask_method_combo = QComboBox()
-        self.mask_method_combo.addItem("Otsu 自适应阈值 (推荐)", "otsu")
-        self.mask_method_combo.addItem("自适应阈值", "adaptive")
-        self.mask_method_combo.addItem("相对百分位阈值", "relative")
-        self.mask_method_combo.setCurrentIndex(0)  # 默认选择otsu
-        self.mask_method_combo.currentIndexChanged.connect(self.update_mask_method)
-        self.mask_method_combo.setToolTip("选择用于生成投影区域掩膜的方法：\n"
-                                        "• Otsu 自适应阈值 (推荐): 基于Otsu算法，稳定可靠\n"
-                                        "• 自适应阈值: 结合多特征的智能阈值化\n"
-                                        "• 相对百分位阈值: 基于百分位的相对阈值方法")
-        mask_form_layout.addRow("掩膜生成方法:", self.mask_method_combo)
         
         # 掩膜置信度
         self.mask_confidence_spinbox = QDoubleSpinBox()
@@ -1005,10 +957,10 @@ class ThreeFreqPhaseUnwrapperUI(QMainWindow):
         self.mask_confidence_spinbox.setDecimals(1)
         self.mask_confidence_spinbox.setValue(self.mask_confidence)
         self.mask_confidence_spinbox.valueChanged.connect(self.update_mask_confidence)
-        self.mask_confidence_spinbox.setToolTip("输入 0.1-0.9 的数值以设置掩膜置信度\n\n"
-                                              "• 自适应方法：结合振幅、调制度、相位稳定性等多特征\n"
-                                              "• Otsu方法：置信度对此方法影响较小\n"
-                                              "• 相对阈值方法：基于百分位的阈值选择")
+        self.mask_confidence_spinbox.setToolTip("设置掩膜置信度 (0.1-0.9)\n"
+                                              "较低的值：掩膜范围更大\n"
+                                              "较高的值：掩膜范围更严格\n"
+                                              "推荐范围：0.4-0.6")
         mask_form_layout.addRow("掩膜置信度:", self.mask_confidence_spinbox)
         
         # 置信度说明标签
@@ -1129,14 +1081,7 @@ class ThreeFreqPhaseUnwrapperUI(QMainWindow):
         self.use_mask = state == 2  # Qt.Checked = 2
         
         # 启用/禁用掩膜相关的控件
-        self.mask_method_combo.setEnabled(self.use_mask)
         self.mask_confidence_spinbox.setEnabled(self.use_mask)
-        self.update_mask_confidence_info()
-    
-    @Slot(int)
-    def update_mask_method(self, index: int):
-        """更新掩膜方法"""
-        self.mask_method = self.mask_method_combo.itemData(index)
         self.update_mask_confidence_info()
     
     @Slot(float)
@@ -1153,39 +1098,17 @@ class ThreeFreqPhaseUnwrapperUI(QMainWindow):
             return
             
         confidence = self.mask_confidence
-        method = self.mask_method
         
-        # 根据不同方法提供不同的建议
-        if method == "adaptive":
-            if confidence < 0.4:
-                info = f"当前值: {confidence:.1f} (自适应-宽松，保留更多区域但可能含噪声)"
-                color = "#ff9500"  # 橙色
-            elif confidence <= 0.6:
-                info = f"当前值: {confidence:.1f} (自适应-推荐，智能多特征平衡)"
-                color = "#51cf66"  # 绿色
-            else:
-                info = f"当前值: {confidence:.1f} (自适应-严格，仅保留高质量区域)"
-                color = "#339af0"  # 蓝色
-        elif method == "otsu":
-            if confidence < 0.4:
-                info = f"当前值: {confidence:.1f} (Otsu方法，置信度对此方法影响较小)"
-                color = "#868e96"  # 灰色
-            elif confidence <= 0.6:
-                info = f"当前值: {confidence:.1f} (Otsu方法，传统自动阈值化)"
-                color = "#51cf66"  # 绿色
-            else:
-                info = f"当前值: {confidence:.1f} (Otsu方法，置信度对此方法影响较小)"
-                color = "#868e96"  # 灰色
-        else:  # relative
-            if confidence < 0.4:
-                info = f"当前值: {confidence:.1f} (相对阈值-宽松，保留更多百分位)"
-                color = "#ff6b6b"  # 红色
-            elif confidence <= 0.6:
-                info = f"当前值: {confidence:.1f} (相对阈值-推荐，平衡百分位选择)"
-                color = "#51cf66"  # 绿色
-            else:
-                info = f"当前值: {confidence:.1f} (相对阈值-严格，仅保留高百分位)"
-                color = "#ffd43b"  # 黄色
+        # 使用Otsu方法的建议
+        if confidence < 0.4:
+            info = f"当前值: {confidence:.1f} (较宽松，保留更多区域)"
+            color = "#ff9500"  # 橙色
+        elif confidence <= 0.6:
+            info = f"当前值: {confidence:.1f} (推荐，平衡质量与覆盖)"
+            color = "#51cf66"  # 绿色
+        else:
+            info = f"当前值: {confidence:.1f} (较严格，仅保留高质量区域)"
+            color = "#339af0"  # 蓝色
         
         self.mask_confidence_info_label.setText(info)
         self.mask_confidence_info_label.setStyleSheet(f"color: {color}; font-size: 11px; font-style: italic;")
@@ -1291,7 +1214,6 @@ class ThreeFreqPhaseUnwrapperUI(QMainWindow):
             "filter_kernel_size": self.filter_size_spinbox.value(),
             "unwrap_direction": self.unwrap_direction,
             "use_mask": self.use_mask,
-            "mask_method": self.mask_method,
             "mask_confidence": self.mask_confidence
         }
         
@@ -1316,17 +1238,15 @@ class ThreeFreqPhaseUnwrapperUI(QMainWindow):
 
         if "horizontal" in result:
             res_data = result["horizontal"]
-            d3_path = os.path.join(self.output_dir, "unwrapped_phase_horizontal_3d.png")
+            # 不再使用3D图像
             self.horizontal_viewer.set_interactive_2d_image(res_data["unwrapped_phase"], res_data.get("quality_map"))
-            self.horizontal_viewer.set_3d_image(d3_path)
         else:
             self.horizontal_viewer.reset()
 
         if "vertical" in result:
             res_data = result["vertical"]
-            d3_path = os.path.join(self.output_dir, "unwrapped_phase_vertical_3d.png")
+            # 不再使用3D图像
             self.vertical_viewer.set_interactive_2d_image(res_data["unwrapped_phase"], res_data.get("quality_map"))
-            self.vertical_viewer.set_3d_image(d3_path)
         else:
             self.vertical_viewer.reset()
 

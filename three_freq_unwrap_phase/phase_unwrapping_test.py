@@ -225,7 +225,7 @@ class PhaseUnwrapViewer(QMainWindow):
             # 保存原始相位数据
             cv.imwrite(os.path.join(self.output_dir, "unwrapped_phase_horizontal.tiff"), self.unwrap_phase_x)
             cv.imwrite(os.path.join(self.output_dir, "unwrapped_phase_vertical.tiff"), self.unwrap_phase_y)
-            cv.imwrite(os.path.join(self.output_dir, "phase_quality.tiff"), self.ratio)
+            # 不再保存相位质量图
             
             self.statusBar.showMessage(f"所有图像已保存至: {self.output_dir}")
         except Exception as e:
@@ -367,14 +367,23 @@ def main():
     print("正在进行相位解包裹...")
     
     # 创建多频相位解包裹对象并处理
-    phase_processor = multi_phase(f=fx, step=phase_step, images=images, ph0=ph0)
+    phase_processor = multi_phase(
+        f=fx, 
+        step=phase_step, 
+        images=images, 
+        ph0=ph0,
+        output_dir=args.output_dir,
+        save_intermediate=True,
+        use_mask=True,  # 启用掩膜以提高质量
+        mask_confidence=0.5  # 中等置信度
+    )
     
     # 临时禁用matplotlib显示，避免中间过程显示图像
     if args.hide_intermediate:
         plt.ioff()  # 关闭交互模式
     
-    # 执行相位解包裹
-    unwrap_phase_y, unwrap_phase_x, ratio = phase_processor.get_phase()
+    # 执行相位解包裹（会自动保存结果到output_dir）
+    unwrap_phase_y, unwrap_phase_x, ratio, _, _ = phase_processor.get_phase()
     
     # 恢复matplotlib交互模式
     if args.hide_intermediate:
@@ -382,12 +391,13 @@ def main():
         plt.ion()  # 重新开启交互模式
     
     print("相位解包裹完成")
-    
-    # 保存结果
-    print(f"正在保存结果到: {args.output_dir}")
-    cv.imwrite(os.path.join(args.output_dir, "unwrapped_phase_vertical.tiff"), unwrap_phase_y)
-    cv.imwrite(os.path.join(args.output_dir, "unwrapped_phase_horizontal.tiff"), unwrap_phase_x)
-    cv.imwrite(os.path.join(args.output_dir, "phase_quality.tiff"), ratio)
+    print(f"结果已自动保存到: {args.output_dir}")
+    print(f"中间结果保存在以下文件夹:")
+    print(f"  - 1_wrapped_phases: 包裹相位")
+    print(f"  - 2_first_heterodyne: 第一次多频外差结果")
+    print(f"  - 3_second_heterodyne: 第二次多频外差结果")
+    print(f"  - 4_phase_unwrapping: 相位展开流程")
+    print(f"  - 5_final_results: 最终结果（包含TIFF文件）")
     
     # 可视化结果
     if args.interactive:
