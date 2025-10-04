@@ -139,6 +139,24 @@ class UnwrappingWorker(QThread):
             # 准备处理时，先保证数组初始化为空
             combined_images = []
             
+            # 首先获取实际图像尺寸
+            # 从任一方向读取第一张图像以获取正确的尺寸
+            reference_shape = None
+            if process_vertical:
+                first_img_path = self.freq_data[frequencies[0]]['v'][0]
+                reference_img = cv.imread(first_img_path, cv.IMREAD_GRAYSCALE)
+                if reference_img is not None:
+                    reference_shape = reference_img.shape
+            elif process_horizontal:
+                first_img_path = self.freq_data[frequencies[0]]['h'][0]
+                reference_img = cv.imread(first_img_path, cv.IMREAD_GRAYSCALE)
+                if reference_img is not None:
+                    reference_shape = reference_img.shape
+            
+            # 如果无法获取参考尺寸，使用默认值
+            if reference_shape is None:
+                reference_shape = (600, 800)
+            
             # 首先添加垂直方向的图像（如果有）
             if process_vertical:
                 for freq in frequencies:  # 按频率顺序添加
@@ -148,8 +166,8 @@ class UnwrappingWorker(QThread):
                             raise ValueError(f"处理垂直图像时发现空图像: {img_path}")
                         combined_images.append(img)
             else:
-                # 如果不处理垂直方向，添加12个空白图像占位
-                dummy_img = np.zeros((600, 800), dtype=np.uint8)  # 创建一个适当大小的空白图像
+                # 如果不处理垂直方向，添加12个空白图像占位，使用实际图像的尺寸
+                dummy_img = np.zeros(reference_shape, dtype=np.uint8)
                 for _ in range(3 * self.phase_step):
                     combined_images.append(dummy_img.copy())
             
@@ -162,8 +180,8 @@ class UnwrappingWorker(QThread):
                             raise ValueError(f"处理水平图像时发现空图像: {img_path}")
                         combined_images.append(img)
             else:
-                # 如果不处理水平方向，添加12个空白图像占位
-                dummy_img = np.zeros((600, 800), dtype=np.uint8)  # 创建一个适当大小的空白图像
+                # 如果不处理水平方向，添加12个空白图像占位，使用实际图像的尺寸
+                dummy_img = np.zeros(reference_shape, dtype=np.uint8)
                 for _ in range(3 * self.phase_step):
                     combined_images.append(dummy_img.copy())
             
@@ -185,6 +203,17 @@ class UnwrappingWorker(QThread):
             
             # 创建处理对象，正确传递图像数组
             try:
+                # 打印调试信息
+                print(f"=" * 60)
+                print(f"UI: 准备创建多频相位解包裹处理对象")
+                print(f"UI: 相移步数 = {self.phase_step}")
+                print(f"UI: 频率设置 = {frequencies}")
+                print(f"UI: 组合图像数量 = {len(combined_images)}")
+                print(f"UI: 初始相位偏移 = {self.ph0}")
+                print(f"UI: 是否使用掩膜 = {self.use_mask}")
+                print(f"UI: 掩膜置信度 = {self.mask_confidence}")
+                print(f"=" * 60)
+                
                 processor = multi_phase(
                     f=frequencies, 
                     step=self.phase_step, 
@@ -1132,6 +1161,21 @@ class ThreeFreqPhaseUnwrapperUI(QMainWindow):
                 match = re.search(r'[iI](\d+)\.', os.path.basename(path))
                 return int(match.group(1)) if match else -1
             all_imgs_map = {get_img_num(p): p for p in image_files if get_img_num(p) != -1}
+            
+            # 检测可能的图像数量不匹配
+            if all_imgs_map:
+                max_img_num = max(all_imgs_map.keys())
+                
+                # 如果检测到的图像编号超过了当前设置的步数，给出警告
+                if max_img_num > 2*n:
+                    QMessageBox.warning(
+                        self, 
+                        "图像数量不匹配", 
+                        f"检测到图像编号最大为 I{max_img_num}，但当前相移步数设置为 {n}。\n"
+                        f"期望的图像命名范围是 I1-I{2*n}。\n"
+                        f"如果您有 {max_img_num//2} 步相移的图像，请先在设置中修改相移步数为 {max_img_num//2}。"
+                    )
+                    return
 
             h_paths = [all_imgs_map.get(i) for i in range(1, n + 1) if all_imgs_map.get(i)]
             v_paths = [all_imgs_map.get(i) for i in range(n + 1, 2 * n + 1) if all_imgs_map.get(i)]
@@ -1204,6 +1248,27 @@ class ThreeFreqPhaseUnwrapperUI(QMainWindow):
         if process_vertical and not can_process_v:
             QMessageBox.warning(self, "数据不足", "垂直方向处理需要所有频率都有垂直方向的图像。")
             return
+        
+        # 验证图像数量是否匹配相移步数
+        for freq, data in freq_data.items():
+            if 'h' in data and len(data['h']) != self.n_steps:
+                QMessageBox.critical(
+                    self, 
+                    "图像数量错误", 
+                    f"频率 {freq} 的水平图像数量为 {len(data['h'])}，\n"
+                    f"但相移步数设置为 {self.n_steps}。\n"
+                    f"请确保每个频率的图像数量与相移步数一致。"
+                )
+                return
+            if 'v' in data and len(data['v']) != self.n_steps:
+                QMessageBox.critical(
+                    self, 
+                    "图像数量错误", 
+                    f"频率 {freq} 的垂直图像数量为 {len(data['v'])}，\n"
+                    f"但相移步数设置为 {self.n_steps}。\n"
+                    f"请确保每个频率的图像数量与相移步数一致。"
+                )
+                return
         
         # 准备处理参数
         worker_params = {

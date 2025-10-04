@@ -9,6 +9,37 @@ from skimage import morphology
 import skimage.filters as filters
 import os
 
+# 导入 Mask_generation.py 模块（权威的掩膜生成实现）
+try:
+    # 尝试直接导入（如果在同一目录或已在sys.path中）
+    from Mask_generation import (
+        generate_projection_mask,
+        save_mask_visualization,
+        PhaseShiftingAlgorithm as MG_PhaseShiftingAlgorithm,
+    )
+except ImportError:
+    # 若直接导入失败，尝试从父目录导入
+    import sys as _sys
+    _current_dir = os.path.dirname(os.path.abspath(__file__))
+    _parent_dir = os.path.dirname(_current_dir)
+    if _parent_dir not in _sys.path:
+        _sys.path.insert(0, _parent_dir)
+    try:
+        from Mask_generation import (
+            generate_projection_mask,
+            save_mask_visualization,
+            PhaseShiftingAlgorithm as MG_PhaseShiftingAlgorithm,
+        )
+    except ImportError:
+        # 最后尝试：从当前目录的父目录中导入
+        if _current_dir not in _sys.path:
+            _sys.path.insert(0, _current_dir)
+        from Mask_generation import (
+            generate_projection_mask,
+            save_mask_visualization,
+            PhaseShiftingAlgorithm as MG_PhaseShiftingAlgorithm,
+        )
+
 # 设置matplotlib支持中文显示 - 使用更可靠的方法
 try:
     # 尝试使用SimHei字体
@@ -39,9 +70,13 @@ class PhaseShiftingAlgorithm(Enum):
     n_step = 2          # N步相移
 
 
+# =============================================================================
+# 掩膜生成函数（直接使用 Mask_generation.py 模块）
+# =============================================================================
+
 def generate_projection_mask_three_freq(images: List[np.ndarray], 
                                        algorithm: PhaseShiftingAlgorithm = PhaseShiftingAlgorithm.four_step,
-                                       method: str = 'adaptive', 
+                                       method: str = 'otsu', 
                                        thresh_rel: Optional[float] = None, 
                                        min_area: int = 500,
                                        confidence: float = 0.5,
@@ -49,19 +84,18 @@ def generate_projection_mask_three_freq(images: List[np.ndarray],
                                        save_debug_images: bool = True,
                                        output_dir: Optional[str] = None) -> np.ndarray:
     """
-    改进的三频相移图像投影区域掩膜生成
-    专门针对条纹图像的特点进行优化，避免条纹明暗变化对掩膜的干扰
+    兼容接口适配器：直接调用 Mask_generation.py 的 generate_projection_mask 函数
     
     参数:
         images: 相移图像列表
-        algorithm: 相移算法类型
-        method: 阈值化方法 ('otsu', 'relative', 'adaptive', 'modulation')
-        thresh_rel: 相对阈值（仅用于relative方法）
+        algorithm: 相移算法类型（本模块的枚举）
+        method: 阈值化方法（固定为'otsu'）
+        thresh_rel: 未使用（保留参数兼容性）
         min_area: 最小连通区域面积
-        confidence: 掩膜置信度阈值 (0.1-0.9)，控制掩膜的严格程度
+        confidence: 掩膜置信度阈值
         border_trim_px: 边界收缩像素数
-        save_debug_images: 是否保存调试用的特征图像
-        output_dir: 输出目录，如果提供则在其中创建mask文件夹保存图像
+        save_debug_images: 是否保存调试图像
+        output_dir: 输出目录
     
     返回:
         mask: 二值掩膜，True表示投影区域
@@ -69,583 +103,45 @@ def generate_projection_mask_three_freq(images: List[np.ndarray],
     if len(images) < 3:
         raise ValueError(f"至少需要3张图像，但只提供了{len(images)}张")
     
-    # 计算基础特征
-    imgs = np.stack([img.astype(np.float32) for img in images], axis=2)
-    I_max = np.max(imgs, axis=2)
-    I_min = np.min(imgs, axis=2)
-    I_mean = np.mean(imgs, axis=2)
-    I_std = np.std(imgs, axis=2)
-
-    # 关键改进：使用调制度作为主要特征，而不是亮度
-    # 调制度能更好地区分投影区域和背景，不受条纹明暗变化影响
-    modulation = (I_max - I_min) / (I_max + I_min + 1e-9)  # 调制度
-    amplitude = (I_max - I_min) / 2.0  # 振幅
+    # 简单的图像有效性检查
+    all_zero = all(np.sum(img) == 0 for img in images)
+    if all_zero:
+        print(f"⚠ 警告: 传入的所有图像都是全零图像！")
+        print(f"   这通常是因为图像加载错误或使用了占位的空白图像。")
     
-    # 计算相位稳定性 - 投影区域的相位变化应该是规律的
-    phase_stability = I_std / (I_mean + 1e-9)
-    
-    # 计算亮度对比度 - 用于辅助判断
-    brightness_contrast = I_std / (I_mean + 1e-9)
-    
-    # 应用噪声抑制
-    modulation, amplitude, phase_stability = _apply_noise_reduction_improved(
-        modulation, amplitude, phase_stability, I_mean)
-    
-    # 归一化特征到0-255范围
-    mod_norm = cv.normalize(modulation, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
-    amp_norm = cv.normalize(amplitude, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
-    stab_norm = cv.normalize(phase_stability, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
-    mean_norm = cv.normalize(I_mean, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
-    
-    # 保存调试图像到mask文件夹
-    if save_debug_images and output_dir is not None:
-        mask_dir = os.path.join(output_dir, 'mask')
-        os.makedirs(mask_dir, exist_ok=True)
-        
-        # 保存特征图像
-        cv.imwrite(os.path.join(mask_dir, 'Modulation.png'), mod_norm)
-        cv.imwrite(os.path.join(mask_dir, 'Amplitude.png'), amp_norm)
-        cv.imwrite(os.path.join(mask_dir, 'Phase_Stability.png'), stab_norm)
-        cv.imwrite(os.path.join(mask_dir, 'Mean_Intensity.png'), mean_norm)
-        
-        print(f"特征图像已保存到: {mask_dir}")
-        
-        # 保存原始特征的浮点数版本（用于分析）
-        np.save(os.path.join(mask_dir, 'modulation_raw.npy'), modulation)
-        np.save(os.path.join(mask_dir, 'amplitude_raw.npy'), amplitude)
-        np.save(os.path.join(mask_dir, 'phase_stability_raw.npy'), phase_stability)
-        np.save(os.path.join(mask_dir, 'mean_intensity_raw.npy'), I_mean)
-    
-    # 选择改进的阈值化方法
-    if method == 'modulation':
-        mask = _modulation_based_thresholding(mod_norm, amp_norm, mean_norm, confidence)
-    elif method == 'adaptive':
-        mask = _adaptive_thresholding_improved(mod_norm, amp_norm, stab_norm, mean_norm, confidence)
-    elif method == 'otsu':
-        mask = _otsu_thresholding_improved(mod_norm, amp_norm, mean_norm)
-    elif method == 'relative':
-        mask = _relative_thresholding_improved(mod_norm, amp_norm, mean_norm, thresh_rel, confidence)
-    else:
-        raise ValueError(f"不支持的阈值化方法: {method}")
-    
-    print(f"掩膜生成参数: 方法={method}, 置信度={confidence:.2f}")
-    
-    # 改进的形态学处理
-    mask = _improved_morphological_processing(mask, min_area)
-    
-    # 改进的边界处理
-    mask = _improved_border_processing(mask, border_trim_px)
-    
-    # 改进的连通性优化
-    mask = _improved_connectivity_optimization(mask)
-    
-    # 最终的投影区域完整性处理
-    mask = _ensure_projection_integrity(mask)
-    
-    # 保存最终掩膜图像
-    if save_debug_images and output_dir is not None:
-        mask_dir = os.path.join(output_dir, 'mask')
-        os.makedirs(mask_dir, exist_ok=True)
-        
-        # 保存最终掩膜
-        final_mask_img = mask.astype(np.uint8) * 255
-        cv.imwrite(os.path.join(mask_dir, 'final_mask.png'), final_mask_img)
-        cv.imwrite(os.path.join(mask_dir, 'Final Mask.png'), final_mask_img)  # 与unwrap_phase.py保持一致
-        
-        # 保存掩膜的numpy数组
-        np.save(os.path.join(mask_dir, 'final_mask.npy'), mask)
-        
-        # 计算并保存掩膜统计信息
-        total_pixels = mask.size
-        valid_pixels = np.sum(mask)
-        coverage_ratio = valid_pixels / total_pixels
-        
-        # 计算连通分量信息
-        num_labels, labels = cv.connectedComponents(mask.astype(np.uint8))
-        num_components = num_labels - 1  # 减去背景
-        
-        # 计算最大连通分量的面积
-        if num_components > 0:
-            areas = [(labels == i).sum() for i in range(1, num_labels)]
-            max_component_area = max(areas)
-            max_component_ratio = max_component_area / total_pixels
+    # 将本模块的 PhaseShiftingAlgorithm 映射到 Mask_generation 模块的枚举
+    try:
+        mg_alg = MG_PhaseShiftingAlgorithm[algorithm.name]
+    except (KeyError, AttributeError):
+        # 如果名称匹配失败，使用值进行判断
+        if algorithm == PhaseShiftingAlgorithm.three_step:
+            mg_alg = MG_PhaseShiftingAlgorithm.three_step
+        elif algorithm == PhaseShiftingAlgorithm.four_step:
+            mg_alg = MG_PhaseShiftingAlgorithm.four_step
         else:
-            max_component_area = 0
-            max_component_ratio = 0
-        
-        stats_file = os.path.join(mask_dir, 'mask_stats.txt')
-        with open(stats_file, 'w', encoding='utf-8') as f:
-            f.write(f"掩膜生成统计信息\n")
-            f.write(f"================\n")
-            f.write(f"方法: {method}\n")
-            f.write(f"置信度: {confidence:.2f}\n")
-            f.write(f"总像素数: {total_pixels}\n")
-            f.write(f"有效像素数: {valid_pixels}\n")
-            f.write(f"覆盖率: {coverage_ratio:.1%}\n")
-            f.write(f"连通分量数: {num_components}\n")
-            f.write(f"最大分量面积: {max_component_area}\n")
-            f.write(f"最大分量占比: {max_component_ratio:.1%}\n")
-            f.write(f"最小连通区域面积: {min_area}\n")
-            f.write(f"边界收缩像素数: {border_trim_px}\n")
-            f.write(f"空洞填充: 已启用 (投影区域完整性保证)\n")
-        
-        print(f"掩膜图像和统计信息已保存到: {mask_dir}")
-        print(f"最终掩膜覆盖率: {coverage_ratio:.1%}")
+            mg_alg = MG_PhaseShiftingAlgorithm.n_step
+    
+    
+    # 直接调用 Mask_generation 模块的函数生成掩膜
+    mask = generate_projection_mask(
+        images=images,
+        algorithm=mg_alg,
+        method=method,
+        thresh_rel=thresh_rel,
+        min_area=min_area,
+        confidence=confidence,
+        border_trim_px=border_trim_px
+    )
+    
+    # 保存可视化图像（调用 Mask_generation 模块的函数）
+    if save_debug_images and output_dir is not None:
+        mask_dir = os.path.join(output_dir, 'mask')
+        os.makedirs(mask_dir, exist_ok=True)
+        save_mask_visualization(images, mask, mask_dir)
     
     return mask.astype(bool)
 
 
-def _apply_noise_reduction_improved(modulation, amplitude, phase_stability, I_mean):
-    """改进的噪声抑制方法"""
-    # 使用更温和的高斯滤波
-    mod_filtered = cv.GaussianBlur(modulation, (3, 3), 0.8)
-    amp_filtered = cv.GaussianBlur(amplitude, (3, 3), 0.8)
-    stab_filtered = cv.GaussianBlur(phase_stability, (3, 3), 0.8)
-    
-    # 检测异常区域 - 低亮度且高噪声的区域
-    noise_mask = (phase_stability > np.percentile(phase_stability, 90)) & \
-                 (I_mean < np.percentile(I_mean, 25))
-    
-    # 在噪声区域使用滤波后的值
-    modulation = np.where(noise_mask, mod_filtered, modulation)
-    amplitude = np.where(noise_mask, amp_filtered, amplitude)
-    phase_stability = np.where(noise_mask, stab_filtered, phase_stability)
-    
-    return modulation, amplitude, phase_stability
-
-def _modulation_based_thresholding(mod_norm, amp_norm, mean_norm, confidence):
-    """基于调制度的阈值化方法 - 最适合条纹图像"""
-    # 分析调制度分布
-    valid_mod = mod_norm[mod_norm > 0]
-    valid_amp = amp_norm[amp_norm > 0]
-    
-    if len(valid_mod) == 0 or len(valid_amp) == 0:
-        return np.zeros_like(mod_norm, dtype=bool)
-    
-    # 动态调制度阈值 - 根据置信度调整
-    # 低置信度使用更低的阈值，高置信度使用更高的阈值
-    mod_percentile = max(10, 50 - confidence * 30)  # 从20-50%范围调整
-    mod_threshold = max(10, np.percentile(valid_mod, mod_percentile))
-    
-    # 动态振幅阈值
-    amp_percentile = max(15, 40 - confidence * 20)  # 从20-40%范围调整
-    amp_threshold = max(10, np.percentile(valid_amp, amp_percentile))
-    
-    # 更宽松的亮度阈值 - 不要过度排除暗区域
-    brightness_threshold = max(5, np.percentile(mean_norm, 15))
-    
-    # 基础掩膜
-    basic_mask = (mod_norm >= mod_threshold) & \
-                 (amp_norm >= amp_threshold) & \
-                 (mean_norm > brightness_threshold)
-    
-    # 如果基础掩膜覆盖率太低，进一步降低阈值
-    coverage = np.sum(basic_mask) / basic_mask.size
-    
-    if coverage < 0.6:  # 如果覆盖率低于60%
-        # 进一步降低阈值
-        mod_threshold = max(5, np.percentile(valid_mod, max(5, mod_percentile - 15)))
-        amp_threshold = max(5, np.percentile(valid_amp, max(10, amp_percentile - 10)))
-        brightness_threshold = max(3, np.percentile(mean_norm, 10))
-        
-        basic_mask = (mod_norm >= mod_threshold) & \
-                     (amp_norm >= amp_threshold) & \
-                     (mean_norm > brightness_threshold)
-    
-    return basic_mask
-
-def _adaptive_thresholding_improved(mod_norm, amp_norm, stab_norm, mean_norm, confidence):
-    """改进的自适应阈值化方法"""
-    # 基于调制度的多级阈值
-    mod_high = np.percentile(mod_norm[mod_norm > 0], 70)
-    mod_medium = np.percentile(mod_norm[mod_norm > 0], 50)
-    mod_low = np.percentile(mod_norm[mod_norm > 0], 30)
-    
-    # 基于振幅的阈值
-    amp_threshold = np.percentile(amp_norm[amp_norm > 0], 40)
-    
-    # 亮度阈值
-    brightness_threshold = np.percentile(mean_norm, 25)
-    
-    # 根据置信度选择阈值策略
-    if confidence >= 0.7:
-        # 高置信度：严格标准
-        mask = (mod_norm >= mod_high) & (amp_norm >= amp_threshold) & (mean_norm > brightness_threshold)
-    elif confidence >= 0.4:
-        # 中等置信度：平衡标准
-        mask = (mod_norm >= mod_medium) & (amp_norm >= amp_threshold * 0.8) & (mean_norm > brightness_threshold)
-    else:
-        # 低置信度：宽松标准
-        mask = (mod_norm >= mod_low) & (amp_norm >= amp_threshold * 0.6) & (mean_norm > brightness_threshold * 0.8)
-    
-    return mask
-
-def _otsu_thresholding_improved(mod_norm, amp_norm, mean_norm):
-    """改进的Otsu阈值化方法"""
-    # 对调制度使用Otsu阈值
-    _, mask_mod = cv.threshold(mod_norm, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
-    
-    # 对振幅使用较低的阈值
-    amp_threshold = max(20, np.percentile(amp_norm[amp_norm > 0], 25))
-    mask_amp = amp_norm >= amp_threshold
-    
-    # 亮度阈值
-    brightness_threshold = np.percentile(mean_norm, 20)
-    mask_brightness = mean_norm > brightness_threshold
-    
-    # 组合掩膜：调制度为主，振幅和亮度为辅
-    mask = (mask_mod > 0) & mask_amp & mask_brightness
-    
-    return mask
-
-def _relative_thresholding_improved(mod_norm, amp_norm, mean_norm, thresh_rel, confidence):
-    """改进的相对阈值化方法"""
-    if thresh_rel is None:
-        thresh_rel = 0.3
-    
-    # 调整阈值参数
-    adjusted_thresh = thresh_rel * (1.5 - confidence * 0.5)
-    
-    mod_threshold = np.percentile(mod_norm, 100 * (1 - adjusted_thresh))
-    amp_threshold = np.percentile(amp_norm, 100 * (1 - adjusted_thresh * 0.8))
-    brightness_threshold = np.percentile(mean_norm, 25)
-    
-    mask = (mod_norm >= mod_threshold) & \
-           (amp_norm >= amp_threshold) & \
-           (mean_norm > brightness_threshold)
-    
-    return mask
-
-def _improved_morphological_processing(mask, min_area):
-    """改进的形态学处理 - 专门针对投影区域的完整性优化"""
-    mask = mask.astype(np.uint8)
-    
-    # 第一步：轻微的开运算，去除小的噪声点
-    kernel_small = cv.getStructuringElement(cv.MORPH_ELLIPSE, (3, 3))
-    mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel_small)
-    
-    # 第二步：强化的闭运算，连接近邻区域
-    kernel_medium = cv.getStructuringElement(cv.MORPH_ELLIPSE, (7, 7))
-    mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel_medium)
-    
-    # 第三步：移除小的连通区域
-    mask = morphology.remove_small_objects(mask.astype(bool), min_size=min_area//4)
-    
-    # 第四步：强化空洞填充 - 投影仪投影的是完整面，不应该有空洞
-    # 使用更大的阈值填充所有合理大小的空洞
-    mask = morphology.remove_small_holes(mask, area_threshold=min_area * 2)  # 增加阈值
-    
-    # 第五步：额外的空洞填充 - 使用形态学闭运算进一步填充
-    kernel_large = cv.getStructuringElement(cv.MORPH_ELLIPSE, (15, 15))
-    mask = cv.morphologyEx(mask.astype(np.uint8), cv.MORPH_CLOSE, kernel_large)
-    
-    # 第六步：再次强化空洞填充
-    mask = morphology.remove_small_holes(mask.astype(bool), area_threshold=min_area * 5)
-    
-    # 第七步：最终的小区域清理
-    mask = morphology.remove_small_objects(mask, min_size=min_area)
-    
-    return mask.astype(np.uint8)
-
-def _improved_border_processing(mask, border_trim_px):
-    """改进的边界处理"""
-    if not border_trim_px or border_trim_px <= 0:
-        return mask
-    
-    h, w = mask.shape
-    # 限制边界处理的范围
-    trim_size = min(border_trim_px, min(h // 20, w // 20))
-    
-    if trim_size > 0:
-        # 检查边界区域的掩膜密度
-        border_density_threshold = 0.15
-        
-        # 上边界
-        if np.mean(mask[:trim_size, :]) < border_density_threshold:
-            mask[:trim_size, :] = 0
-        
-        # 下边界
-        if np.mean(mask[-trim_size:, :]) < border_density_threshold:
-            mask[-trim_size:, :] = 0
-        
-        # 左边界
-        if np.mean(mask[:, :trim_size]) < border_density_threshold:
-            mask[:, :trim_size] = 0
-        
-        # 右边界
-        if np.mean(mask[:, -trim_size:]) < border_density_threshold:
-            mask[:, -trim_size:] = 0
-    
-    return mask
-
-def _improved_connectivity_optimization(mask):
-    """改进的连通性优化"""
-    # 找到所有连通分量
-    num_labels, labels = cv.connectedComponents(mask.astype(np.uint8))
-    
-    if num_labels <= 2:  # 只有背景和一个前景
-        return mask
-    
-    # 计算每个连通分量的面积和紧密度
-    areas = []
-    compactness = []
-    
-    for i in range(1, num_labels):
-        component_mask = (labels == i)
-        area = np.sum(component_mask)
-        areas.append(area)
-        
-        # 计算紧密度（面积与外接矩形面积的比值）
-        if area > 0:
-            coords = np.where(component_mask)
-            if len(coords[0]) > 0:
-                bbox_area = (np.max(coords[0]) - np.min(coords[0]) + 1) * \
-                           (np.max(coords[1]) - np.min(coords[1]) + 1)
-                compact = area / bbox_area if bbox_area > 0 else 0
-            else:
-                compact = 0
-        else:
-            compact = 0
-        compactness.append(compact)
-    
-    if len(areas) == 0:
-        return mask
-    
-    # 选择保留的连通分量
-    max_area = max(areas)
-    area_threshold = max_area * 0.2  # 面积阈值
-    compactness_threshold = 0.1      # 紧密度阈值
-    
-    new_mask = np.zeros_like(mask)
-    for i, (area, compact) in enumerate(zip(areas, compactness)):
-        # 保留大面积或者紧密的连通分量
-        if area >= area_threshold or (area >= max_area * 0.05 and compact >= compactness_threshold):
-            new_mask[labels == (i + 1)] = 1
-    
-    return new_mask.astype(np.uint8)
-
-def _ensure_projection_integrity(mask):
-    """
-    确保投影区域的完整性和边界平滑性
-    投影仪投影时是一个完整的面，不应该有内部空洞，且边界应该相对平滑
-    """
-    mask = mask.astype(np.uint8)
-    
-    # 1. 找到最大的连通分量（主要投影区域）
-    num_labels, labels = cv.connectedComponents(mask)
-    
-    if num_labels <= 1:  # 没有前景区域
-        return mask
-    
-    # 找到最大连通分量
-    areas = [(labels == i).sum() for i in range(1, num_labels)]
-    if len(areas) == 0:
-        return mask
-    
-    max_area_idx = np.argmax(areas) + 1
-    main_projection = (labels == max_area_idx).astype(np.uint8)
-    
-    # 2. 边界平滑处理
-    # 使用形态学开运算和闭运算来平滑边界
-    kernel_smooth = cv.getStructuringElement(cv.MORPH_ELLIPSE, (7, 7))
-    
-    # 先进行闭运算填充小的凹陷
-    smoothed = cv.morphologyEx(main_projection, cv.MORPH_CLOSE, kernel_smooth)
-    # 再进行开运算去除小的突起
-    smoothed = cv.morphologyEx(smoothed, cv.MORPH_OPEN, kernel_smooth)
-    
-    # 3. 计算主投影区域的凸包（用于参考）
-    contours, _ = cv.findContours(smoothed, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-    
-    if len(contours) == 0:
-        return mask
-    
-    # 找到最大轮廓
-    main_contour = max(contours, key=cv.contourArea)
-    
-    # 计算凸包
-    hull = cv.convexHull(main_contour)
-    
-    # 4. 创建凸包掩膜
-    hull_mask = np.zeros_like(mask)
-    cv.fillPoly(hull_mask, [hull], 255)
-    
-    # 5. 渐进式边界平滑
-    # 使用多次小幅度的形态学操作来逐步平滑边界
-    final_mask = smoothed.copy()
-    
-    # 多次小幅度的平滑操作
-    for i in range(3):
-        kernel_size = 3 + i * 2  # 逐渐增大核大小 (3, 5, 7)
-        kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (kernel_size, kernel_size))
-        
-        # 轻微的闭运算
-        temp = cv.morphologyEx(final_mask, cv.MORPH_CLOSE, kernel)
-        
-        # 只在凸包范围内应用平滑
-        final_mask = np.where(hull_mask > 0, temp, final_mask)
-    
-    # 6. 填充内部空洞
-    final_mask = morphology.remove_small_holes(final_mask.astype(bool), area_threshold=1000)
-    
-    # 7. 最终边界优化：使用高斯模糊 + 阈值化来进一步平滑边界
-    # 将二值掩膜转换为浮点数
-    float_mask = final_mask.astype(np.float32)
-    
-    # 应用轻微的高斯模糊
-    blurred = cv.GaussianBlur(float_mask, (5, 5), 1.0)
-    
-    # 重新二值化，使用稍低的阈值以保持区域大小
-    _, final_mask = cv.threshold(blurred, 0.3, 1.0, cv.THRESH_BINARY)
-    
-    # 8. 最后一次连通性检查和小区域清理
-    final_mask = final_mask.astype(np.uint8)
-    final_mask = morphology.remove_small_objects(final_mask.astype(bool), min_size=500)
-    final_mask = morphology.remove_small_holes(final_mask, area_threshold=2000)
-    
-    return final_mask.astype(np.uint8)
-
-def _apply_noise_reduction_three_freq(A, M, S, I_mean):
-    """应用噪声抑制 - 保持向后兼容"""
-    return _apply_noise_reduction_improved(M, A, S, I_mean)
-
-
-def _adaptive_thresholding_three_freq(A_norm, M_norm, S_norm, I_norm, confidence):
-    """自适应阈值化方法"""
-    # 计算每个特征的多级阈值
-    th_A_low = np.percentile(A_norm[A_norm > 0], 25)
-    th_A_high = np.percentile(A_norm[A_norm > 0], 60)
-    
-    th_M_low = np.percentile(M_norm[M_norm > 0], 25)
-    th_M_high = np.percentile(M_norm[M_norm > 0], 60)
-    
-    th_I = np.percentile(I_norm, 40)
-    
-    # 稳定性阈值
-    th_S = np.percentile(S_norm, 75)
-    
-    # 多级判断
-    high_confidence = (A_norm >= th_A_high) & (M_norm >= th_M_high)
-    medium_confidence = ((A_norm >= th_A_low) | (M_norm >= th_M_low)) & (S_norm <= th_S)
-    low_confidence = (A_norm >= th_A_low) | (M_norm >= th_M_low)
-    
-    # 强度约束
-    intensity_valid = I_norm > th_I
-    
-    # 根据置信度参数选择区域
-    if confidence >= 0.8:
-        mask = high_confidence & intensity_valid
-    elif confidence >= 0.6:
-        mask = high_confidence & intensity_valid
-    elif confidence >= 0.4:
-        mask = (high_confidence | (medium_confidence & (A_norm >= th_A_high * 0.8))) & intensity_valid
-    elif confidence >= 0.2:
-        mask = (high_confidence | medium_confidence) & intensity_valid
-    else:
-        mask = low_confidence & intensity_valid
-    
-    return mask
-
-
-def _otsu_thresholding_three_freq(A_norm, M_norm, I_norm):
-    """改进的Otsu方法"""
-    _, mask_A = cv.threshold(A_norm, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
-    _, mask_M = cv.threshold(M_norm, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
-    
-    # 降低强度阈值，使更多区域通过
-    th_I = np.percentile(I_norm, 30)
-    mask_I = (I_norm > th_I).astype(np.uint8) * 255
-    
-    mask = np.logical_or(mask_A > 0, mask_M > 0)
-    mask = np.logical_and(mask, mask_I > 0)
-    
-    return mask
-
-
-def _relative_thresholding_three_freq(A_norm, M_norm, I_norm, thresh_rel, confidence):
-    """改进的相对阈值方法"""
-    if thresh_rel is None:
-        thresh_rel = 0.3
-    
-    # 调整相对阈值计算，使其更宽松
-    adjusted_thresh_rel = float(thresh_rel) * (2.5 - float(confidence))
-    th_A = np.percentile(A_norm, 100 * (1 - adjusted_thresh_rel))
-    th_M = np.percentile(M_norm, 100 * (1 - adjusted_thresh_rel))
-    th_I = np.percentile(I_norm, 30)
-    
-    mask = np.logical_or(A_norm >= th_A, M_norm >= th_M)
-    mask = np.logical_and(mask, I_norm > th_I)
-    
-    return mask
-
-
-def _progressive_morphological_processing_three_freq(mask, min_area):
-    """渐进式形态学处理"""
-    mask = mask.astype(np.uint8)
-    
-    # 更温和的形态学处理
-    mask = morphology.binary_closing(mask, morphology.disk(2))
-    mask = morphology.remove_small_objects(mask.astype(bool), min_size=min_area//8)
-    mask = morphology.binary_closing(mask, morphology.disk(3))
-    mask = morphology.remove_small_holes(mask, area_threshold=min_area//4)
-    mask = morphology.remove_small_objects(mask, min_size=min_area//2)
-    
-    return mask.astype(np.uint8)
-
-
-def _smart_border_trimming_three_freq(mask, border_trim_px):
-    """智能边界处理"""
-    if not border_trim_px or border_trim_px <= 0:
-        return mask
-    
-    h, w = mask.shape
-    bt = min(border_trim_px, min(h // 15, w // 15))
-    
-    if bt > 0:
-        border_noise_ratio = 0.1
-        
-        # 检查上下边界
-        top_ratio = np.mean(mask[:bt, :])
-        bottom_ratio = np.mean(mask[-bt:, :])
-        left_ratio = np.mean(mask[:, :bt])
-        right_ratio = np.mean(mask[:, -bt:])
-        
-        if top_ratio < border_noise_ratio:
-            mask[:bt, :] = 0
-        if bottom_ratio < border_noise_ratio:
-            mask[-bt:, :] = 0
-        if left_ratio < border_noise_ratio:
-            mask[:, :bt] = 0
-        if right_ratio < border_noise_ratio:
-            mask[:, -bt:] = 0
-    
-    return mask
-
-
-def _connectivity_optimization_three_freq(mask):
-    """连通性优化"""
-    # 保留最大的几个连通分量
-    num_labels, labels = cv.connectedComponents(mask.astype(np.uint8))
-    
-    if num_labels <= 2:  # 背景 + 1个前景
-        return mask
-    
-    # 计算每个连通分量的面积
-    areas = [(labels == i).sum() for i in range(1, num_labels)]
-    
-    if len(areas) == 0:
-        return mask
-    
-    # 保留最大的连通分量，以及面积超过最大面积30%的其他分量
-    max_area = max(areas)
-    area_threshold = max_area * 0.3
-    
-    new_mask = np.zeros_like(mask)
-    for i, area in enumerate(areas):
-        if area >= area_threshold:
-            new_mask[labels == (i + 1)] = 1
-    
-    return new_mask.astype(np.uint8)
 
 class multi_phase():
     """
@@ -670,7 +166,20 @@ class multi_phase():
             mask_confidence: 浮点数，掩膜置信度 (0.1-0.9)，越高越严格
         """
         self.f = f                # 频率列表
-        self.images = images      # 相移图像
+        
+        # 确保images是列表（如果是numpy数组，转换为列表以便索引）
+        # 或者保持原样（UI传递的是列表）
+        if isinstance(images, np.ndarray):
+            # 如果已经是numpy数组，检查维度
+            if images.ndim == 3:
+                # 如果是3D数组 (n_images, height, width)，转换为列表
+                self.images = [images[i] for i in range(images.shape[0])]
+            else:
+                self.images = images
+        else:
+            # 如果是列表，直接使用
+            self.images = images
+        
         self.step = step          # 相移步数
         self.ph0 = ph0            # 相移初始相位
         self.f12 = f[0] - f[1]    # 第1和第2个频率的差值(高频-中频)
@@ -690,13 +199,29 @@ class multi_phase():
         使用正弦和余弦项计算相移图像的包裹相位，并计算幅值和偏移量
         
         参数:
-            image: ndarray，相移图像组，形状为[step, height, width]
+            image: ndarray或列表，相移图像组，形状为[step, height, width]
             
         返回:
             result: ndarray，归一化的包裹相位图
             amp: ndarray，调制幅值
             offset: ndarray，亮度偏移
         """
+        # 确保image是numpy数组
+        # 如果是列表，需要堆叠成3D数组 [step, height, width]
+        if isinstance(image, list):
+            image = np.stack(image, axis=0)
+        elif isinstance(image, np.ndarray):
+            # 如果已经是数组，确保形状正确
+            if image.ndim != 3:
+                raise ValueError(f"图像数组维度不正确，期望3维 [step, height, width]，实际为 {image.ndim} 维")
+        
+        # 验证图像数量是否与相移步数匹配
+        if image.shape[0] != self.step:
+            raise ValueError(
+                f"图像数量 ({image.shape[0]}) 与相移步数 ({self.step}) 不匹配。"
+                f"请检查图像切片范围和相移步数设置。"
+            )
+        
         # 生成相移角度数组(0,2π/N,4π/N...)
         temp = 2*np.pi*np.arange(self.step,dtype=np.float32)/self.step
         temp.shape=-1,1,1  # 调整形状以便于广播运算
@@ -1109,44 +634,135 @@ class multi_phase():
             phase_2y: 垂直方向中频包裹相位
             phase_2x: 水平方向中频包裹相位
         """
+        # 打印处理参数信息
+        print(f"=" * 60)
+        print(f"三频相位解包裹处理开始")
+        print(f"相移步数: {self.step}")
+        print(f"频率设置: {self.f}")
+        print(f"总图像数: {len(self.images)}")
+        print(f"期望图像数: {6 * self.step} (3个频率 × 2个方向 × {self.step}步)")
+        print(f"=" * 60)
+        
+        # 重要说明：
+        # 相移步数（3步或4步）只影响第1步"解码包裹相位"的计算
+        # 一旦得到包裹相位后，后续的三频外差解包裹流程完全相同，
+        # 与包裹相位是通过3步还是4步相移得到的无关
+        
         # 0. 生成掩膜（如果启用）
         if self.use_mask:
-            print(f"正在生成投影区域掩膜 (使用Otsu自适应阈值方法, 置信度: {self.mask_confidence})...")
+            print(f"=" * 60)
+            print(f"正在生成投影区域掩膜 (使用Otsu自适应阈值方法, 置信度: {self.mask_confidence})")
+            print(f"=" * 60)
             
-            # 使用所有图像生成掩膜（可以使用全部24张图像以获得更好的掩膜质量）
-            all_images_list = [self.images[i] for i in range(len(self.images))]
+            step = self.step
             
-            self.mask = generate_projection_mask_three_freq(
-                images=all_images_list,
-                algorithm=PhaseShiftingAlgorithm.four_step if self.step == 4 else PhaseShiftingAlgorithm.three_step,
-                method='otsu',  # 固定使用otsu方法
-                confidence=self.mask_confidence,
-                min_area=500,
-                border_trim_px=10,
-                save_debug_images=True,
-                output_dir=self.output_dir
-            )
+            # 智能选择用于掩膜生成的图像：
+            # 优先使用垂直高频图像（索引0:step），如果全零则使用水平高频图像（索引3*step:4*step）
+            # 这样可以避免使用占位的全零图像
             
-            # 统计掩膜覆盖率
-            mask_coverage = np.sum(self.mask) / self.mask.size
-            print(f"掩膜生成完成，有效区域覆盖率: {mask_coverage:.1%}")
+            # 先尝试垂直高频图像
+            vertical_high_freq_images = [self.images[i] for i in range(step)]
             
-            if mask_coverage < 0.1:
-                print(f"警告: 掩膜覆盖率过低 ({mask_coverage:.1%})，建议调整掩膜参数或检查图像质量")
+            # 检查垂直高频图像是否有效（不是全零）
+            vertical_valid = any(np.sum(img) > 0 for img in vertical_high_freq_images)
+            
+            if vertical_valid:
+                # 使用垂直高频图像
+                mask_images = vertical_high_freq_images
+                print(f"使用垂直方向高频图像生成掩膜")
+                print(f"图像索引范围: [0:{step}]")
+            else:
+                # 垂直图像全零，使用水平高频图像
+                horizontal_high_freq_images = [self.images[i] for i in range(3*step, 4*step)]
+                horizontal_valid = any(np.sum(img) > 0 for img in horizontal_high_freq_images)
+                
+                if horizontal_valid:
+                    mask_images = horizontal_high_freq_images
+                    print(f"垂直图像为占位图像（全零），改用水平方向高频图像生成掩膜")
+                    print(f"图像索引范围: [{3*step}:{4*step}]")
+                else:
+                    # 两个方向都是全零，这是错误的
+                    raise ValueError("垂直和水平方向的高频图像都是全零，无法生成掩膜！请检查图像加载是否正确。")
+            
+            print(f"相移步数: {step}")
+            print(f"使用 {len(mask_images)} 张高频图像生成掩膜")
+            print(f"相移算法: {step}步相移")
+            
+            # 打印图像信息用于调试
+            for i, img in enumerate(mask_images):
+                print(f"  图像{i+1}: 形状={img.shape}, 类型={img.dtype}, 最小值={np.min(img)}, 最大值={np.max(img)}")
+            
+            # 确定掩膜保存目录
+            mask_dir = os.path.join(self.output_dir, 'mask')
+            os.makedirs(mask_dir, exist_ok=True)
+            print(f"掩膜保存目录: {mask_dir}")
+            
+            # 生成掩膜（直接使用 Mask_generation.py 模块）
+            try:
+                # 调用 generate_projection_mask_three_freq，它会内部调用 Mask_generation.py
+                self.mask = generate_projection_mask_three_freq(
+                    images=mask_images,
+                    algorithm=PhaseShiftingAlgorithm.four_step if self.step == 4 else PhaseShiftingAlgorithm.three_step,
+                    method='otsu',
+                    confidence=self.mask_confidence,
+                    min_area=500,
+                    border_trim_px=10,
+                    save_debug_images=True,  # 自动保存可视化
+                    output_dir=self.output_dir  # 函数内部会创建 mask 子目录
+                )
+                
+                # 统计掩膜覆盖率
+                if self.mask is not None:
+                    mask_coverage = np.sum(self.mask) / self.mask.size
+                    print(f"✓ 掩膜生成完成")
+                    print(f"✓ 有效区域覆盖率: {mask_coverage:.1%}")
+                    print(f"✓ 有效像素数: {np.sum(self.mask)}")
+                    
+                    if mask_coverage < 0.1:
+                        print(f"⚠ 警告: 掩膜覆盖率过低 ({mask_coverage:.1%})")
+                        print(f"⚠ 建议: 调整掩膜参数或检查图像质量")
+                else:
+                    print(f"✗ 错误: 掩膜生成失败")
+                    self.mask = None
+            except Exception as e:
+                print(f"✗ 掩膜生成异常: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                self.mask = None
+            
+            print(f"=" * 60)
         else:
             print("未启用掩膜，将处理整个图像")
             self.mask = None
         
-        # 1. 解码各个频率的相位
+        # ========================================================================
+        # 第 1 步：解码各个频率的包裹相位（唯一与相移步数相关的步骤）
+        # ========================================================================
+        # 
+        # 这是整个流程中唯一需要区分3步/4步相移的地方！
+        # - 3步相移：每个频率使用3张图像计算包裹相位
+        # - 4步相移：每个频率使用4张图像计算包裹相位
+        #
+        # 根据相移步数动态计算图像切片范围
+        step = self.step  # 相移步数（3或4）
+        
+        print(f"\n第1步：使用 {step} 步相移算法解码包裹相位...")
+        
         # 解码垂直方向的三个频率的相位
-        phase_1y,amp1_y,offset1_y = self.decode_phase(image=self.images[0:4])   # 高频
-        phase_2y,amp2_y,offset2_y = self.decode_phase(image=self.images[4:8])   # 中频
-        phase_3y,amp3_y,offset3_y = self.decode_phase(image=self.images[8:12])  # 低频
+        phase_1y,amp1_y,offset1_y = self.decode_phase(image=self.images[0:step])           # 高频
+        phase_2y,amp2_y,offset2_y = self.decode_phase(image=self.images[step:2*step])     # 中频
+        phase_3y,amp3_y,offset3_y = self.decode_phase(image=self.images[2*step:3*step])   # 低频
 
         # 解码水平方向的三个频率的相位
-        phase_1x,amp1_x,offset1_x = self.decode_phase(image=self.images[12:16]) # 高频
-        phase_2x,amp2_x,offset2_x = self.decode_phase(image=self.images[16:20]) # 中频
-        phase_3x,amp3_x,offset3_x = self.decode_phase(image=self.images[20:24]) # 低频
+        phase_1x,amp1_x,offset1_x = self.decode_phase(image=self.images[3*step:4*step])   # 高频
+        phase_2x,amp2_x,offset2_x = self.decode_phase(image=self.images[4*step:5*step])   # 中频
+        phase_3x,amp3_x,offset3_x = self.decode_phase(image=self.images[5*step:6*step])   # 低频
+        
+        print(f"✓ 包裹相位解码完成 (使用了 {step} 步相移算法)")
+        print(f"\n" + "=" * 60)
+        print(f"注意：后续的三频外差解包裹流程与相移步数无关")
+        print(f"所有步骤只依赖于频率关系和已得到的包裹相位数值")
+        print(f"=" * 60 + "\n")
         
         # 应用掩膜到包裹相位（如果启用）
         # 注意：掩膜只需在包裹相位阶段应用一次
@@ -1187,7 +803,15 @@ class multi_phase():
         """
         #plt.show()
 
-        # 2. 外差法获取逐级展开的相位差
+        # ========================================================================
+        # 第 2 步：外差法计算相位差（与相移步数无关）
+        # ========================================================================
+        #
+        # 从这里开始，所有操作都与相移步数无关！
+        # 无论包裹相位是用3步还是4步得到的，外差法的数学原理完全相同
+        #
+        print(f"第2步：外差法计算相位差...")
+        
         # 计算垂直方向相位差
         phase_12y = self.phase_diff(phase_1y,phase_2y)  # 频率1和2的差异
         phase_23y = self.phase_diff(phase_2y,phase_3y)  # 频率2和3的差异
@@ -1197,6 +821,8 @@ class multi_phase():
         phase_12x = self.phase_diff(phase_1x,phase_2x)  # 频率1和2的差异
         phase_23x = self.phase_diff(phase_2x,phase_3x)  # 频率2和3的差异
         phase_123x = self.phase_diff(phase_12x,phase_23x) # 差异的差异(等效最低频)
+        
+        print(f"✓ 相位差计算完成")
         
         # 保存第一次多频外差结果
         self._save_phase_image(phase_12y, 'phase_12y.png', '2_first_heterodyne')
@@ -1239,21 +865,29 @@ class multi_phase():
         """
         #plt.show()
 
-        # 3. 平滑最低等效频率相位以提高鲁棒性
+        # ========================================================================
+        # 第 3 步：平滑最低等效频率相位（与相移步数无关）
+        # ========================================================================
+        print(f"\n第3步：平滑最低等效频率相位...")
         phase_123y = cv.GaussianBlur(phase_123y,(3,3),0)
         phase_123x = cv.GaussianBlur(phase_123x,(3,3),0)
+        print(f"✓ 平滑完成")
         
         # 保存第二次多频外差结果
         self._save_phase_image(phase_123y, 'phase_123y.png', '3_second_heterodyne')
         self._save_phase_image(phase_123x, 'phase_123x.png', '3_second_heterodyne')
 
-        # 4. 相位展开流程 - 自底向上展开
+        # ========================================================================
+        # 第 4 步：第一级相位展开（与相移步数无关）
+        # ========================================================================
+        print(f"\n第4步：第一级相位展开...")
         # 使用最低等效频率相位(phase_123y/x)展开中等频率相位差(phase_12y/x和phase_23y/x)
         unwarp_phase_12_y = self.unwarpphase(phase_123y,phase_12y,1,self.f12)
         unwarp_phase_23_y = self.unwarpphase(phase_123y,phase_23y,1,self.f23)
 
         unwarp_phase_12_x = self.unwarpphase(phase_123x,phase_12x,1,self.f12)
         unwarp_phase_23_x = self.unwarpphase(phase_123x,phase_23x,1,self.f23)
+        print(f"✓ 第一级展开完成")
         
         # 保存相位展开流程结果
         self._save_phase_image(unwarp_phase_12_y, 'unwarp_phase_12_y.png', '4_phase_unwrapping')
@@ -1287,13 +921,18 @@ class multi_phase():
         plt.tight_layout()
         """
         
-        # 5. 使用展开后的中等频率相位差(unwarp_phase_12_y/x和unwarp_phase_23_y/x)
+        # ========================================================================
+        # 第 5 步：第二级相位展开（与相移步数无关）
+        # ========================================================================
+        print(f"\n第5步：第二级相位展开...")
+        # 使用展开后的中等频率相位差(unwarp_phase_12_y/x和unwarp_phase_23_y/x)
         # 展开中频相位(phase_2y/x)
         unwarp_phase2_y_12 = self.unwarpphase(unwarp_phase_12_y,phase_2y,self.f12,self.f[1])
         unwarp_phase2_y_23 = self.unwarpphase(unwarp_phase_23_y,phase_2y,self.f23,self.f[1])
 
         unwarp_phase2_x_12 = self.unwarpphase(unwarp_phase_12_x,phase_2x,self.f12,self.f[1])
         unwarp_phase2_x_23 = self.unwarpphase(unwarp_phase_23_x,phase_2x,self.f23,self.f[1])
+        print(f"✓ 第二级展开完成")
         
         # 保存最终结果（2D图像和TIFF）
         self._save_phase_image(unwarp_phase2_y_12/self.f[1], 'unwrap_phase2_y_12_2d.png', '5_final_results')
@@ -1332,13 +971,19 @@ class multi_phase():
         plt.tight_layout()
         """
 
+        # ========================================================================
+        # 第 6-7 步：两路径平均与归一化（与相移步数无关）
+        # ========================================================================
+        print(f"\n第6步：两路径平均...")
         # 6. 取两个展开路径的平均值以提高鲁棒性
         unwarp_phase_y = (unwarp_phase2_y_12+unwarp_phase2_y_23)/2
         unwarp_phase_x = (unwarp_phase2_x_12+unwarp_phase2_x_23)/2
 
+        print(f"第7步：归一化相位结果...")
         # 7. 归一化相位结果
         unwarp_phase_y/=self.f[1]  # 以中频为基准归一化
         unwarp_phase_x/=self.f[1]  # 以中频为基准归一化
+        print(f"✓ 三频外差解包裹完成")
         
         # 注意：不需要在这里再次应用掩膜
         # 因为包裹相位已经应用了掩膜，解包裹过程会保持掩膜外区域的无效性
@@ -1362,11 +1007,20 @@ class multi_phase():
         plt.tight_layout()
         """
 
+        # ========================================================================
+        # 第 8 步：计算相位质量图（与相移步数无关）
+        # ========================================================================
+        print(f"\n第8步：计算相位质量图...")
         # 8. 计算相位质量，使用调制度/偏移比值的最小值
         ratio_x = np.min([amp1_x/offset1_x,amp2_x/offset2_x,amp3_x/offset3_x],axis=0)
         ratio_y = np.min([amp1_y/offset1_y,amp2_y/offset2_y,amp3_y/offset3_y],axis=0)
 
         ratio = np.min([ratio_x,ratio_y],axis=0)  # 取水平和垂直方向的最小值作为最终质量图
+        print(f"✓ 质量图计算完成")
+        
+        print(f"\n" + "=" * 60)
+        print(f"三频相位解包裹处理全部完成！")
+        print(f"=" * 60 + "\n")
         
         # 不再保存相位质量图文件
         
