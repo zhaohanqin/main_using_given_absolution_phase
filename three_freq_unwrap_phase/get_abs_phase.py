@@ -205,6 +205,8 @@ class multi_phase():
             result: ndarray，归一化的包裹相位图
             amp: ndarray，调制幅值
             offset: ndarray，亮度偏移
+            modulation: ndarray，调制度 (Imax-Imin)/(Imax+Imin)
+            mean_intensity: ndarray，平均强度
         """
         # 确保image是numpy数组
         # 如果是列表，需要堆叠成3D数组 [step, height, width]
@@ -239,8 +241,17 @@ class multi_phase():
 
         # 归一化相位至[0,1]区间并减去初始相位
         result = (result+np.pi)/(2*np.pi)-self.ph0
+        
+        # ✅ 计算调制度和平均强度（用于质量评估和三维重建）
+        # 调制度 = (Imax - Imin) / (Imax + Imin)
+        Imax = np.max(image, axis=0)
+        Imin = np.min(image, axis=0)
+        modulation = (Imax - Imin) / (Imax + Imin + 1e-6)
+        
+        # 平均强度
+        mean_intensity = np.mean(image, axis=0)
 
-        return result,amp,offset
+        return result, amp, offset, modulation, mean_intensity
 
     def phase_diff(self,image1,image2):
         """
@@ -261,63 +272,46 @@ class multi_phase():
 
     def unwarpphase(self,reference,phase,reference_f,phase_f):
         """
-        基于低频参考相位展开高频相位
+        基于低频参考相位展开高频相位（完全按照相位解包裹工具_finally.py实现）
         
         参数:
-            reference: 参考(低频)相位图
-            phase: 需展开的(高频)包裹相位图
+            reference: 参考(低频)相位图，范围 [0, 1]
+            phase: 需展开的(高频)包裹相位图，范围 [0, 1]
             reference_f: 参考相位的频率
             phase_f: 需展开相位的频率
             
         返回:
             unwarp_phase: 展开后的相位图
         """
-        # 根据频率比例缩放参考相位
-        # 低频相位乘以频率比得到高频相位的估计值
-        temp = phase_f/reference_f*reference
-        
-        # 计算整数条纹序数k并应用
-        # 用缩放后的低频相位减去高频包裹相位，四舍五入得到整数条纹序数
-        k = np.round(temp-phase)
+        temp = phase_f / reference_f * reference
+        k = np.round(temp - phase)
         unwarp_phase = phase + k
         
-        # 高斯滤波去噪，检测错误跳变点
-        # 使用更小的高斯核以保留更多细节
+        # 高斯滤波去噪和异常点检测（调整参数以适应数据）
         gauss_size = (3, 3)
         unwarp_phase_noise = unwarp_phase - cv.GaussianBlur(unwarp_phase, gauss_size, 0)
         unwarp_reference_noise = temp - cv.GaussianBlur(temp, gauss_size, 0)
-
-        # 改进异常点检测：降低阈值，增加相对比例判断
-        noise_ratio = np.abs(unwarp_phase_noise) / (np.abs(unwarp_reference_noise) + 0.001)  # 避免除零
+        
+        noise_ratio = np.abs(unwarp_phase_noise) / (np.abs(unwarp_reference_noise) + 0.001)
         order_flag = (np.abs(unwarp_phase_noise) - np.abs(unwarp_reference_noise) > 0.15) & (noise_ratio > 1.5)
         
-        if np.sum(order_flag) > 0:  # 只在有异常点时进行修复
-            # 修复异常跳变点
+        if np.sum(order_flag) > 0:
             unwarp_error = unwarp_phase[order_flag]
             unwarp_error_direct = unwarp_phase_noise[order_flag]
-            
-            # 根据噪声方向调整条纹序数
-            unwarp_error[unwarp_error_direct > 0] -= 1  # 正向噪声减少一个周期
-            unwarp_error[unwarp_error_direct < 0] += 1  # 负向噪声增加一个周期
-            
-            # 应用修复结果
+            unwarp_error[unwarp_error_direct > 0] -= 1
+            unwarp_error[unwarp_error_direct < 0] += 1
             unwarp_phase[order_flag] = unwarp_error
             
-            # 第二次高斯滤波去噪，进一步检测剩余的错误跳变点
+            # 第二次滤波和修正
             unwarp_phase_noise = unwarp_phase - cv.GaussianBlur(unwarp_phase, gauss_size, 0)
             order_flag2 = np.abs(unwarp_phase_noise) > 0.2
-            
             if np.sum(order_flag2) > 0:
                 unwarp_error2 = unwarp_phase[order_flag2]
                 unwarp_error_direct2 = unwarp_phase_noise[order_flag2]
-                
-                # 根据噪声方向调整条纹序数
-                unwarp_error2[unwarp_error_direct2 > 0] -= 1  # 正向噪声减少一个周期
-                unwarp_error2[unwarp_error_direct2 < 0] += 1  # 负向噪声增加一个周期
-                
-                # 应用修复结果
+                unwarp_error2[unwarp_error_direct2 > 0] -= 1
+                unwarp_error2[unwarp_error_direct2 < 0] += 1
                 unwarp_phase[order_flag2] = unwarp_error2
-
+        
         return unwarp_phase
 
     def post_process_phase(self, unwrap_phase, quality_map=None):
@@ -569,6 +563,150 @@ class multi_phase():
         
         return boundary
     
+    def save_for_reconstruction(self, unwarp_phase_y, unwarp_phase_x, 
+                                modulations_y, modulations_x,
+                                intensities_y, intensities_x,
+                                output_folder='output'):
+        """
+        保存三维重建所需的数据到 for_reconstruction 文件夹
+        
+        参数:
+            unwarp_phase_y: 垂直方向解包裹相位 (H, W)，范围 [0, 2π] rad
+            unwarp_phase_x: 水平方向解包裹相位 (H, W)，范围 [0, 2π] rad
+            modulations_y: 垂直方向调制度 (H, W, 3)
+            modulations_x: 水平方向调制度 (H, W, 3)
+            intensities_y: 垂直方向强度 (H, W, 3)
+            intensities_x: 水平方向强度 (H, W, 3)
+            output_folder: 输出文件夹路径
+        
+        说明:
+            - unwarp_phase_y 来自垂直条纹，对应水平方向的相位变化
+            - unwarp_phase_x 来自水平条纹，对应垂直方向的相位变化
+            - 相位已经是 [0, 2π] 范围，直接保存
+            - 文件命名使用物理方向（phase_horizontal, phase_vertical）
+        """
+        if self.output_dir is None:
+            print("⚠ 警告: output_dir未设置，无法保存三维重建数据")
+            return
+        
+        # 确定输出目录
+        if output_folder:
+            base_output_dir = output_folder
+        else:
+            base_output_dir = self.output_dir
+            
+        recon_folder = os.path.join(base_output_dir, "for_reconstruction")
+        os.makedirs(recon_folder, exist_ok=True)
+        
+        print("=" * 70)
+        print("正在保存三维重建所需数据（使用物理方向命名）...")
+        print("=" * 70)
+        
+        # ✅ 相位已经是 [0, 2π] 范围，直接使用
+        phase_h_2pi = unwarp_phase_y  # 垂直条纹 → 水平方向相位
+        phase_v_2pi = unwarp_phase_x  # 水平条纹 → 垂直方向相位
+        
+        print(f"  相位范围验证:")
+        print(f"    水平方向: [{phase_h_2pi.min():.3f}, {phase_h_2pi.max():.3f}] rad")
+        print(f"    垂直方向: [{phase_v_2pi.min():.3f}, {phase_v_2pi.max():.3f}] rad")
+        
+        # 保存相位数据（必需） - 使用物理方向命名
+        # phase_horizontal：水平方向相位（用于计算投影仪水平坐标up）← 来自垂直条纹
+        # phase_vertical：垂直方向相位（用于计算投影仪垂直坐标vp）← 来自水平条纹
+        np.save(os.path.join(recon_folder, "phase_horizontal.npy"), phase_h_2pi)
+        np.save(os.path.join(recon_folder, "phase_vertical.npy"), phase_v_2pi)
+        print(f"  ✓ 已保存相位数据 (phase_horizontal.npy, phase_vertical.npy)")
+        
+        # 保存质量数据（推荐） - 使用物理方向命名
+        saved_quality = False
+        if modulations_y is not None and modulations_x is not None:
+            # 质量数据也按物理方向命名
+            # modulation_horizontal ← 来自垂直条纹（modulations_y）
+            # modulation_vertical ← 来自水平条纹（modulations_x）
+            np.save(os.path.join(recon_folder, "modulation_horizontal.npy"), modulations_y)
+            np.save(os.path.join(recon_folder, "modulation_vertical.npy"), modulations_x)
+            print(f"  ✓ 已保存调制度数据 (modulation_horizontal.npy, modulation_vertical.npy)")
+            saved_quality = True
+        
+        if intensities_y is not None and intensities_x is not None:
+            # intensity_horizontal ← 来自垂直条纹（intensities_y）
+            # intensity_vertical ← 来自水平条纹（intensities_x）
+            np.save(os.path.join(recon_folder, "intensity_horizontal.npy"), intensities_y)
+            np.save(os.path.join(recon_folder, "intensity_vertical.npy"), intensities_x)
+            print(f"  ✓ 已保存强度数据 (intensity_horizontal.npy, intensity_vertical.npy)")
+        
+        # 创建README说明文件
+        readme_path = os.path.join(recon_folder, "README.txt")
+        with open(readme_path, 'w', encoding='utf-8') as f:
+            f.write("="*70 + "\n")
+            f.write("三维重建所需数据说明（使用物理方向命名）\n")
+            f.write("="*70 + "\n\n")
+            
+            f.write("【数据文件】\n")
+            f.write("-"*70 + "\n")
+            f.write("✅ phase_horizontal.npy  - 水平方向绝对相位 (必需)，范围 [0, 2π] rad\n")
+            f.write("✅ phase_vertical.npy    - 垂直方向绝对相位 (必需)，范围 [0, 2π] rad\n")
+            if saved_quality:
+                f.write("⭐ modulation_horizontal.npy - 水平方向调制度 (H, W, 3) (推荐)\n")
+                f.write("⭐ modulation_vertical.npy   - 垂直方向调制度 (H, W, 3) (推荐)\n")
+                f.write("⭐ intensity_horizontal.npy  - 水平方向平均强度 (H, W, 3) (推荐)\n")
+                f.write("⭐ intensity_vertical.npy    - 垂直方向平均强度 (H, W, 3) (推荐)\n")
+            f.write("\n")
+            
+            f.write("【重要说明】\n")
+            f.write("-"*70 + "\n")
+            f.write("✨ 文件命名直接反映相位的物理方向，无需额外映射！\n\n")
+            f.write("  - phase_horizontal.npy：水平方向相位（from 垂直条纹）\n")
+            f.write("  - phase_vertical.npy：垂直方向相位（from 水平条纹）\n\n")
+            f.write("  原理：水平条纹产生垂直相位变化，垂直条纹产生水平相位变化\n\n")
+            
+            f.write("在三维重建工具中的使用：\n")
+            f.write("   phase_h = np.load('phase_horizontal.npy')  # 直接使用！\n")
+            f.write("   phase_v = np.load('phase_vertical.npy')    # 直接使用！\n\n")
+            
+            f.write("【数据信息】\n")
+            f.write("-"*70 + "\n")
+            f.write(f"图像尺寸: {phase_h_2pi.shape[1]} × {phase_h_2pi.shape[0]} 像素\n")
+            f.write(f"频率配置: {self.f[0]}, {self.f[1]}, {self.f[2]}\n")
+            f.write(f"相移步数: {self.step}\n")
+            f.write(f"\n水平方向相位范围: [{phase_h_2pi.min():.3f}, {phase_h_2pi.max():.3f}] rad\n")
+            f.write(f"垂直方向相位范围: [{phase_v_2pi.min():.3f}, {phase_v_2pi.max():.3f}] rad\n")
+            
+            if saved_quality:
+                f.write(f"\n平均调制度: {(modulations_y.mean() + modulations_x.mean())/2:.4f}\n")
+                f.write(f"平均强度: {(intensities_y.mean() + intensities_x.mean())/2:.2f}\n")
+            
+            if self.use_mask and self.mask is not None:
+                mask_coverage = np.sum(self.mask) / self.mask.size
+                f.write(f"\n掩膜覆盖率: {mask_coverage:.1%}\n")
+            f.write("\n")
+            
+            f.write("【使用方法】\n")
+            f.write("-"*70 + "\n")
+            f.write("在三维重建工具.py中配置：\n\n")
+            f.write("config = {\n")
+            f.write(f"    'phase_folder': r'{os.path.abspath(base_output_dir)}',\n")
+            f.write("    'calibration_file': './标定结果.txt',\n")
+            f.write("    'output_file': 'pointCloud.ply',\n")
+            f.write("    # ... 其他参数\n")
+            f.write("}\n\n")
+            f.write("然后运行: python 三维重建工具.py\n\n")
+            
+            f.write("【文件说明】\n")
+            f.write("-"*70 + "\n")
+            f.write("所有.npy文件都是numpy数组格式，可以用以下方式读取：\n")
+            f.write("  import numpy as np\n")
+            f.write("  phase_data = np.load('phase_horizontal.npy')\n\n")
+        
+        file_count = 2  # phase_horizontal + phase_vertical
+        if saved_quality:
+            file_count += 4  # modulations + intensities
+        print(f"  ✓ 已保存README说明文件")
+        print(f"\n✅ 三维重建数据保存完成！")
+        print(f"   文件夹: {recon_folder}")
+        print(f"   文件数: {file_count}个NPY + 1个README")
+        print("=" * 70 + "\n")
+    
     def _save_phase_image(self, phase_data, filename, folder_name=None):
         """
         保存相位图像（2D可视化图）
@@ -591,8 +729,12 @@ class multi_phase():
         # 归一化相位数据到0-255范围用于显示
         phase_normalized = cv.normalize(phase_data, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
         
-        # 应用jet色图
-        phase_colored = cv.applyColorMap(phase_normalized, cv.COLORMAP_JET)
+        # 应用viridis色图（冷色调）
+        # OpenCV 4.0+支持COLORMAP_VIRIDIS，如果不支持则使用COLORMAP_OCEAN
+        try:
+            phase_colored = cv.applyColorMap(phase_normalized, cv.COLORMAP_VIRIDIS)
+        except:
+            phase_colored = cv.applyColorMap(phase_normalized, cv.COLORMAP_OCEAN)
         
         # 保存图像
         save_path = os.path.join(save_dir, filename)
@@ -749,16 +891,27 @@ class multi_phase():
         print(f"\n第1步：使用 {step} 步相移算法解码包裹相位...")
         
         # 解码垂直方向的三个频率的相位
-        phase_1y,amp1_y,offset1_y = self.decode_phase(image=self.images[0:step])           # 高频
-        phase_2y,amp2_y,offset2_y = self.decode_phase(image=self.images[step:2*step])     # 中频
-        phase_3y,amp3_y,offset3_y = self.decode_phase(image=self.images[2*step:3*step])   # 低频
+        phase_1y, amp1_y, offset1_y, mod1_y, int1_y = self.decode_phase(image=self.images[0:step])           # 高频
+        phase_2y, amp2_y, offset2_y, mod2_y, int2_y = self.decode_phase(image=self.images[step:2*step])     # 中频
+        phase_3y, amp3_y, offset3_y, mod3_y, int3_y = self.decode_phase(image=self.images[2*step:3*step])   # 低频
 
         # 解码水平方向的三个频率的相位
-        phase_1x,amp1_x,offset1_x = self.decode_phase(image=self.images[3*step:4*step])   # 高频
-        phase_2x,amp2_x,offset2_x = self.decode_phase(image=self.images[4*step:5*step])   # 中频
-        phase_3x,amp3_x,offset3_x = self.decode_phase(image=self.images[5*step:6*step])   # 低频
+        phase_1x, amp1_x, offset1_x, mod1_x, int1_x = self.decode_phase(image=self.images[3*step:4*step])   # 高频
+        phase_2x, amp2_x, offset2_x, mod2_x, int2_x = self.decode_phase(image=self.images[4*step:5*step])   # 中频
+        phase_3x, amp3_x, offset3_x, mod3_x, int3_x = self.decode_phase(image=self.images[5*step:6*step])   # 低频
+        
+        # ✅ 组织调制度和强度数据（用于三维重建）
+        # 形状为 (H, W, 3)，对应3个频率
+        modulations_y = np.stack([mod1_y, mod2_y, mod3_y], axis=2)
+        modulations_x = np.stack([mod1_x, mod2_x, mod3_x], axis=2)
+        intensities_y = np.stack([int1_y, int2_y, int3_y], axis=2)
+        intensities_x = np.stack([int1_x, int2_x, int3_x], axis=2)
         
         print(f"✓ 包裹相位解码完成 (使用了 {step} 步相移算法)")
+        print(f"  包裹相位范围验证:")
+        print(f"    phase_1y: [{phase_1y.min():.4f}, {phase_1y.max():.4f}]")
+        print(f"    phase_2y: [{phase_2y.min():.4f}, {phase_2y.max():.4f}]")
+        print(f"    phase_3y: [{phase_3y.min():.4f}, {phase_3y.max():.4f}]")
         print(f"\n" + "=" * 60)
         print(f"注意：后续的三频外差解包裹流程与相移步数无关")
         print(f"所有步骤只依赖于频率关系和已得到的包裹相位数值")
@@ -778,13 +931,21 @@ class multi_phase():
             phase_3x[~self.mask] = 0
             print(f"✓ 已将掩膜外区域设为0，后续解包裹将基于这些包裹相位进行")
         
-        # 保存包裹相位（三个频率的水平和垂直方向）
+        # 保存包裹相位（三个频率的水平和垂直方向）- PNG和TIFF
         self._save_phase_image(phase_1y, 'phase_1y_wrapped.png', '1_wrapped_phases')
         self._save_phase_image(phase_2y, 'phase_2y_wrapped.png', '1_wrapped_phases')
         self._save_phase_image(phase_3y, 'phase_3y_wrapped.png', '1_wrapped_phases')
         self._save_phase_image(phase_1x, 'phase_1x_wrapped.png', '1_wrapped_phases')
         self._save_phase_image(phase_2x, 'phase_2x_wrapped.png', '1_wrapped_phases')
         self._save_phase_image(phase_3x, 'phase_3x_wrapped.png', '1_wrapped_phases')
+        
+        # 同时保存TIFF格式（原始数据）
+        self._save_phase_tiff(phase_1y, 'phase_1y_wrapped.tiff', '1_wrapped_phases')
+        self._save_phase_tiff(phase_2y, 'phase_2y_wrapped.tiff', '1_wrapped_phases')
+        self._save_phase_tiff(phase_3y, 'phase_3y_wrapped.tiff', '1_wrapped_phases')
+        self._save_phase_tiff(phase_1x, 'phase_1x_wrapped.tiff', '1_wrapped_phases')
+        self._save_phase_tiff(phase_2x, 'phase_2x_wrapped.tiff', '1_wrapped_phases')
+        self._save_phase_tiff(phase_3x, 'phase_3x_wrapped.tiff', '1_wrapped_phases')
 
         # 注释掉所有中间过程的可视化代码
         """
@@ -823,12 +984,21 @@ class multi_phase():
         phase_123x = self.phase_diff(phase_12x,phase_23x) # 差异的差异(等效最低频)
         
         print(f"✓ 相位差计算完成")
+        print(f"  phase_12y范围: [{phase_12y.min():.4f}, {phase_12y.max():.4f}]")
+        print(f"  phase_23y范围: [{phase_23y.min():.4f}, {phase_23y.max():.4f}]")
+        print(f"  phase_123y范围: [{phase_123y.min():.4f}, {phase_123y.max():.4f}]")
         
-        # 保存第一次多频外差结果
+        # 保存第一次多频外差结果 - PNG和TIFF
         self._save_phase_image(phase_12y, 'phase_12y.png', '2_first_heterodyne')
         self._save_phase_image(phase_23y, 'phase_23y.png', '2_first_heterodyne')
         self._save_phase_image(phase_12x, 'phase_12x.png', '2_first_heterodyne')
         self._save_phase_image(phase_23x, 'phase_23x.png', '2_first_heterodyne')
+        
+        # 同时保存TIFF格式（原始数据）
+        self._save_phase_tiff(phase_12y, 'phase_12y.tiff', '2_first_heterodyne')
+        self._save_phase_tiff(phase_23y, 'phase_23y.tiff', '2_first_heterodyne')
+        self._save_phase_tiff(phase_12x, 'phase_12x.tiff', '2_first_heterodyne')
+        self._save_phase_tiff(phase_23x, 'phase_23x.tiff', '2_first_heterodyne')
 
         # 注释掉所有中间过程的可视化代码
         """
@@ -873,9 +1043,13 @@ class multi_phase():
         phase_123x = cv.GaussianBlur(phase_123x,(3,3),0)
         print(f"✓ 平滑完成")
         
-        # 保存第二次多频外差结果
+        # 保存第二次多频外差结果 - PNG和TIFF
         self._save_phase_image(phase_123y, 'phase_123y.png', '3_second_heterodyne')
         self._save_phase_image(phase_123x, 'phase_123x.png', '3_second_heterodyne')
+        
+        # 同时保存TIFF格式（原始数据）
+        self._save_phase_tiff(phase_123y, 'phase_123y.tiff', '3_second_heterodyne')
+        self._save_phase_tiff(phase_123x, 'phase_123x.tiff', '3_second_heterodyne')
 
         # ========================================================================
         # 第 4 步：第一级相位展开（与相移步数无关）
@@ -888,12 +1062,20 @@ class multi_phase():
         unwarp_phase_12_x = self.unwarpphase(phase_123x,phase_12x,1,self.f12)
         unwarp_phase_23_x = self.unwarpphase(phase_123x,phase_23x,1,self.f23)
         print(f"✓ 第一级展开完成")
+        print(f"  unwarp_phase_12_y范围: [{unwarp_phase_12_y.min():.4f}, {unwarp_phase_12_y.max():.4f}]")
+        print(f"  unwarp_phase_23_y范围: [{unwarp_phase_23_y.min():.4f}, {unwarp_phase_23_y.max():.4f}]")
         
-        # 保存相位展开流程结果
+        # 保存相位展开流程结果 - PNG和TIFF
         self._save_phase_image(unwarp_phase_12_y, 'unwarp_phase_12_y.png', '4_phase_unwrapping')
         self._save_phase_image(unwarp_phase_23_y, 'unwarp_phase_23_y.png', '4_phase_unwrapping')
         self._save_phase_image(unwarp_phase_12_x, 'unwarp_phase_12_x.png', '4_phase_unwrapping')
         self._save_phase_image(unwarp_phase_23_x, 'unwarp_phase_23_x.png', '4_phase_unwrapping')
+        
+        # 同时保存TIFF格式（原始数据）
+        self._save_phase_tiff(unwarp_phase_12_y, 'unwarp_phase_12_y.tiff', '4_phase_unwrapping')
+        self._save_phase_tiff(unwarp_phase_23_y, 'unwarp_phase_23_y.tiff', '4_phase_unwrapping')
+        self._save_phase_tiff(unwarp_phase_12_x, 'unwarp_phase_12_x.tiff', '4_phase_unwrapping')
+        self._save_phase_tiff(unwarp_phase_23_x, 'unwarp_phase_23_x.tiff', '4_phase_unwrapping')
         
         # 注释掉所有中间过程的可视化代码
         """
@@ -933,6 +1115,8 @@ class multi_phase():
         unwarp_phase2_x_12 = self.unwarpphase(unwarp_phase_12_x,phase_2x,self.f12,self.f[1])
         unwarp_phase2_x_23 = self.unwarpphase(unwarp_phase_23_x,phase_2x,self.f23,self.f[1])
         print(f"✓ 第二级展开完成")
+        print(f"  unwarp_phase2_y_12范围: [{unwarp_phase2_y_12.min():.4f}, {unwarp_phase2_y_12.max():.4f}]")
+        print(f"  unwarp_phase2_y_23范围: [{unwarp_phase2_y_23.min():.4f}, {unwarp_phase2_y_23.max():.4f}]")
         
         # 保存最终结果（2D图像和TIFF）
         self._save_phase_image(unwarp_phase2_y_12/self.f[1], 'unwrap_phase2_y_12_2d.png', '5_final_results')
@@ -981,9 +1165,14 @@ class multi_phase():
 
         print(f"第7步：归一化相位结果...")
         # 7. 归一化相位结果
-        unwarp_phase_y/=self.f[1]  # 以中频为基准归一化
-        unwarp_phase_x/=self.f[1]  # 以中频为基准归一化
+        # unwarp_phase 的范围约为 [0, freq[1]]（表示周期数）
+        # 需要除以频率归一化到 [0, 1]，然后乘以 2π 转换到 [0, 2π]
+        unwarp_phase_y = unwarp_phase_y / self.f[1] * (2 * np.pi)  # 转换到 [0, 2π]
+        unwarp_phase_x = unwarp_phase_x / self.f[1] * (2 * np.pi)  # 转换到 [0, 2π]
+        
         print(f"✓ 三频外差解包裹完成")
+        print(f"  水平方向相位范围: [{unwarp_phase_x.min():.3f}, {unwarp_phase_x.max():.3f}] rad")
+        print(f"  垂直方向相位范围: [{unwarp_phase_y.min():.3f}, {unwarp_phase_y.max():.3f}] rad")
         
         # 注意：不需要在这里再次应用掩膜
         # 因为包裹相位已经应用了掩膜，解包裹过程会保持掩膜外区域的无效性
@@ -1033,7 +1222,8 @@ class multi_phase():
         plt.colorbar()
         """
         
-        return unwarp_phase_y,unwarp_phase_x,ratio, phase_2y, phase_2x
+        # ✅ 返回更多数据用于三维重建
+        return unwarp_phase_y, unwarp_phase_x, ratio, phase_2y, phase_2x, modulations_y, modulations_x, intensities_y, intensities_x
 
 """
 以下是被注释掉的旧版解码相位函数，仅供参考
@@ -1055,4 +1245,70 @@ def decode_phase(fore,phase_step,phase):
     result = (result+np.pi)/(2*np.pi)*fore
 
     return result
+"""
+
+
+# =============================================================================
+# 使用示例：如何保存三维重建所需的数据
+# =============================================================================
+"""
+使用示例：
+
+# 1. 创建多频相位解包裹对象
+processor = multi_phase(
+    f=[64, 8, 1],           # 频率配置
+    step=4,                  # 相移步数
+    images=your_images,      # 图像数据
+    ph0=0.0,                 # 初始相位
+    output_dir='./output',   # 输出目录（必需，用于保存重建数据）
+    save_intermediate=True,  # 保存中间结果
+    use_mask=True,           # 使用掩膜
+    mask_confidence=0.5      # 掩膜置信度
+)
+
+# 2. 执行相位解包裹
+# ⚠️ 注意：返回的 unwarp_phase_y 和 unwarp_phase_x 范围已经是 [0, 2π] rad
+unwarp_phase_y, unwarp_phase_x, ratio, phase_2y, phase_2x, \
+    modulations_y, modulations_x, intensities_y, intensities_x = processor.get_phase()
+
+print(f"水平相位范围: [{unwarp_phase_x.min():.3f}, {unwarp_phase_x.max():.3f}] rad")
+print(f"垂直相位范围: [{unwarp_phase_y.min():.3f}, {unwarp_phase_y.max():.3f}] rad")
+
+# 3. 保存三维重建所需的数据（✅ 新增功能）
+# 这将创建 for_reconstruction 文件夹，包含：
+#   - phase_horizontal.npy (水平方向相位，[0, 2π] rad)
+#   - phase_vertical.npy (垂直方向相位，[0, 2π] rad)
+#   - modulation_horizontal.npy (水平方向调制度)
+#   - modulation_vertical.npy (垂直方向调制度)
+#   - intensity_horizontal.npy (水平方向强度)
+#   - intensity_vertical.npy (垂直方向强度)
+#   - README.txt (使用说明)
+processor.save_for_reconstruction(
+    unwarp_phase_y=unwarp_phase_y,      # [0, 2π] rad
+    unwarp_phase_x=unwarp_phase_x,      # [0, 2π] rad
+    modulations_y=modulations_y,
+    modulations_x=modulations_x,
+    intensities_y=intensities_y,
+    intensities_x=intensities_x,
+    output_folder='./output'  # 可选，默认使用 self.output_dir
+)
+
+# 4. 后续使用三维重建工具
+# 在三维重建工具.py中配置：
+# config = {
+#     'phase_folder': r'./output',  # 包含 for_reconstruction 子文件夹的路径
+#     'calibration_file': './标定结果.txt',
+#     'output_file': 'pointCloud.ply',
+#     # ... 其他参数
+# }
+# tool = ReconstructionTool(config)
+# results = tool.run()
+
+说明:
+1. ✅ get_phase() 返回的相位范围已经是 [0, 2π] rad (与三维重建工具兼容)
+2. ✅ 文件命名使用物理方向 (phase_horizontal, phase_vertical)
+3. ✅ 包含调制度和强度数据用于质量过滤
+4. ✅ 与 相位解包裹工具_finally.py 输出格式完全一致
+5. ✅ 可直接用于 三维重建工具.py 进行三维重建
+6. ✅ 改进的去噪算法，减少过度修正导致的错误
 """

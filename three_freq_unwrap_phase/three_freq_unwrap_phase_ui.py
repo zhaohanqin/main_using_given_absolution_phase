@@ -227,7 +227,9 @@ class UnwrappingWorker(QThread):
             
                 # 调用get_phase()方法获取解包裹结果
                 self.progress_updated.emit(50)
-                unwarp_phase_y, unwarp_phase_x, ratio, wrapped_phase_y, wrapped_phase_x = processor.get_phase()
+                # ✅ 更新：现在返回9个值（增加了调制度和强度数据）
+                unwarp_phase_y, unwarp_phase_x, ratio, wrapped_phase_y, wrapped_phase_x, \
+                    modulations_y, modulations_x, intensities_y, intensities_x = processor.get_phase()
                 
                 # 检查输出结果
                 if process_vertical and (unwarp_phase_y is None or unwarp_phase_y.size == 0):
@@ -270,18 +272,18 @@ class UnwrappingWorker(QThread):
                     cv.imwrite(os.path.join(self.output_dir, "unwrapped_phase_vertical.tiff"), unwarp_phase_y)
                     # 不再保存相位质量图
                     
-                    # 保存2D伪彩色图像
+                    # 保存2D伪彩色图像（冷色调）
                     plt.figure(figsize=(10, 8))
-                    plt.imshow(unwarp_phase_y, cmap='jet')
+                    plt.imshow(unwarp_phase_y, cmap='viridis')
                     plt.colorbar(label='相位值')
                     plt.title('垂直方向解包裹相位2D视图')
                     plt.savefig(os.path.join(self.output_dir, "unwrapped_phase_vertical_2d.png"))
                     plt.close()
                     
-                    # 保存包裹相位的2D伪彩色图像
+                    # 保存包裹相位的2D伪彩色图像（冷色调）
                     if wrapped_phase_y is not None and wrapped_phase_y.size > 0:
                         plt.figure(figsize=(10, 8))
-                        plt.imshow(wrapped_phase_y, cmap='jet')
+                        plt.imshow(wrapped_phase_y, cmap='viridis')
                         plt.colorbar(label='相位值')
                         plt.title('垂直方向包裹相位2D视图')
                         plt.savefig(os.path.join(self.output_dir, "wrapped_phase_vertical_2d.png"))
@@ -290,7 +292,7 @@ class UnwrappingWorker(QThread):
                         # 仅保存包裹相位数据，不含其他元素
                         wrapped_phase_y_normalized = cv.normalize(wrapped_phase_y, None, 0, 1, cv.NORM_MINMAX)
                         plt.figure(figsize=(10, 8), frameon=False)
-                        plt.imshow(wrapped_phase_y_normalized, cmap='jet')
+                        plt.imshow(wrapped_phase_y_normalized, cmap='viridis')
                         plt.axis('off')
                         plt.savefig(os.path.join(self.output_dir, "wrapped_phase_vertical_only.png"), 
                                    bbox_inches='tight', pad_inches=0)
@@ -306,18 +308,18 @@ class UnwrappingWorker(QThread):
                     cv.imwrite(os.path.join(self.output_dir, "unwrapped_phase_horizontal.tiff"), unwarp_phase_x)
                     # 不再保存相位质量图
                     
-                    # 保存2D伪彩色图像
+                    # 保存2D伪彩色图像（冷色调）
                     plt.figure(figsize=(10, 8))
-                    plt.imshow(unwarp_phase_x, cmap='jet')
+                    plt.imshow(unwarp_phase_x, cmap='viridis')
                     plt.colorbar(label='相位值')
                     plt.title('水平方向解包裹相位2D视图')
                     plt.savefig(os.path.join(self.output_dir, "unwrapped_phase_horizontal_2d.png"))
                     plt.close()
                     
-                    # 保存包裹相位的2D伪彩色图像
+                    # 保存包裹相位的2D伪彩色图像（冷色调）
                     if wrapped_phase_x is not None and wrapped_phase_x.size > 0:
                         plt.figure(figsize=(10, 8))
-                        plt.imshow(wrapped_phase_x, cmap='jet')
+                        plt.imshow(wrapped_phase_x, cmap='viridis')
                         plt.colorbar(label='相位值')
                         plt.title('水平方向包裹相位2D视图')
                         plt.savefig(os.path.join(self.output_dir, "wrapped_phase_horizontal_2d.png"))
@@ -326,7 +328,7 @@ class UnwrappingWorker(QThread):
                         # 仅保存包裹相位数据，不含其他元素
                         wrapped_phase_x_normalized = cv.normalize(wrapped_phase_x, None, 0, 1, cv.NORM_MINMAX)
                         plt.figure(figsize=(10, 8), frameon=False)
-                        plt.imshow(wrapped_phase_x_normalized, cmap='jet')
+                        plt.imshow(wrapped_phase_x_normalized, cmap='viridis')
                         plt.axis('off')
                         plt.savefig(os.path.join(self.output_dir, "wrapped_phase_horizontal_only.png"), 
                                    bbox_inches='tight', pad_inches=0)
@@ -355,6 +357,51 @@ class UnwrappingWorker(QThread):
                     import traceback
                     traceback.print_exc()
                     print(f"保存组合相位图失败: {str(e)}")  # 不中断处理，只打印错误
+            
+            # ✅ 保存三维重建所需的数据到 for_reconstruction 文件夹
+            try:
+                if process_horizontal and process_vertical and unwarp_phase_x is not None and unwarp_phase_y is not None:
+                    print("\n正在保存三维重建所需数据...")
+                    processor.save_for_reconstruction(
+                        unwarp_phase_y=unwarp_phase_y,
+                        unwarp_phase_x=unwarp_phase_x,
+                        modulations_y=modulations_y,
+                        modulations_x=modulations_x,
+                        intensities_y=intensities_y,
+                        intensities_x=intensities_x,
+                        output_folder=self.output_dir
+                    )
+                    print("✅ 三维重建数据保存成功！")
+                elif process_horizontal and unwarp_phase_x is not None:
+                    # 只处理水平方向时也保存，但垂直方向数据为None
+                    print("\n正在保存三维重建所需数据（仅水平方向）...")
+                    processor.save_for_reconstruction(
+                        unwarp_phase_y=unwarp_phase_y if unwarp_phase_y is not None else np.zeros_like(unwarp_phase_x),
+                        unwarp_phase_x=unwarp_phase_x,
+                        modulations_y=modulations_y if modulations_y is not None else np.zeros_like(modulations_x),
+                        modulations_x=modulations_x,
+                        intensities_y=intensities_y if intensities_y is not None else np.zeros_like(intensities_x),
+                        intensities_x=intensities_x,
+                        output_folder=self.output_dir
+                    )
+                    print("✅ 三维重建数据保存成功（仅水平方向）！")
+                elif process_vertical and unwarp_phase_y is not None:
+                    # 只处理垂直方向时也保存，但水平方向数据为None
+                    print("\n正在保存三维重建所需数据（仅垂直方向）...")
+                    processor.save_for_reconstruction(
+                        unwarp_phase_y=unwarp_phase_y,
+                        unwarp_phase_x=unwarp_phase_x if unwarp_phase_x is not None else np.zeros_like(unwarp_phase_y),
+                        modulations_y=modulations_y,
+                        modulations_x=modulations_x if modulations_x is not None else np.zeros_like(modulations_y),
+                        intensities_y=intensities_y,
+                        intensities_x=intensities_x if intensities_x is not None else np.zeros_like(intensities_y),
+                        output_folder=self.output_dir
+                    )
+                    print("✅ 三维重建数据保存成功（仅垂直方向）！")
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"⚠ 警告：保存三维重建数据失败: {str(e)}")  # 不中断处理，只打印警告
             
             # 不再生成3D视图，用户不需要
             
@@ -526,7 +573,7 @@ class PhaseImageViewer(QWidget):
         
         self.mouse_hover_info.emit(info_str)
 
-    def set_numpy_image(self, image: np.ndarray, colormap=cv.COLORMAP_JET):
+    def set_numpy_image(self, image: np.ndarray, colormap=None):
         if image is None:
             self.image_label.setText("图像数据为空")
             return
@@ -534,6 +581,13 @@ class PhaseImageViewer(QWidget):
         if image.size == 0:
             self.image_label.setText("图像数据大小为0")
             return
+        
+        # 默认使用viridis冷色调，如果OpenCV不支持则使用OCEAN
+        if colormap is None:
+            try:
+                colormap = cv.COLORMAP_VIRIDIS
+            except:
+                colormap = cv.COLORMAP_OCEAN
         
         try:
             # 确保正确处理相位数据
